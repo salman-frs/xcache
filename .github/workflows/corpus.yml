@@ -82,7 +82,7 @@ jobs:
           node-version: 24
           package-manager-cache: false
       - if: matrix.project.ecosystem == 'python'
-        uses: astral-sh/setup-uv@v10
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: false
       - if: matrix.project.ecosystem == 'gradle'

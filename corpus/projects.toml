@@ -108,11 +108,17 @@ steps = ["cargo build --locked", "cargo test --locked"]
 # Node
 
 [[project]]
-name = "express"
-repo = "expressjs/express"
-rev = "43fca52d28a422c8be48fd489cbd4f2d6152bab6"
+name = "luxon"
+repo = "moment/luxon"
+rev = "f427515a38f6a671f8de663e6bcc040ed81f114e"
 ecosystem = "node"
-setup = ["npm install"]
+steps = ["npm run build", "npm test"]
+
+[[project]]
+name = "koa"
+repo = "koajs/koa"
+rev = "b7ead6f7a2bb56e2948b1c5e1cca77483e89c885"
+ecosystem = "node"
 steps = ["npm run lint", "npm test"]
 
 [[project]]
