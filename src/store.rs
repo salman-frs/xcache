@@ -28,8 +28,8 @@ pub struct Output {
     #[serde(with = "crate::path_serde")]
     pub path: PathBuf,
     pub state: OutputState,
-    /// How long before the end of the run this was last modified. Restoring
-    /// keeps the order of modification times, which make and cargo compare.
+    /// How long before the end of the run this was last modified, so restoring
+    /// can keep the order of modification times, which make and cargo compare.
     #[serde(default)]
     pub age_ns: u64,
 }

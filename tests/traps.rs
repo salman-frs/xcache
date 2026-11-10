@@ -431,6 +431,20 @@ fn touching_an_input_is_not_a_change_by_another_process() {
 }
 
 #[test]
+fn restored_outputs_are_newer_than_the_checkout_they_are_restored_into() {
+    let ws = Workspace::new();
+    ws.write("main.c", "int v;\n");
+    let build = "cp main.c main.o && sleep 2";
+    let up_to_date = "if [ main.c -nt main.o ]; then echo stale; else echo fresh; fi";
+    assert_outcome(&ws.sh(build), "miss");
+
+    fs::remove_file(ws.path("main.o")).unwrap();
+    ws.write("main.c", "int v;\n");
+    assert_outcome(&ws.sh(build), "hit");
+    assert_eq!(ws.sh(up_to_date).stdout, "fresh\n");
+}
+
+#[test]
 fn deletions_are_replayed() {
     let ws = Workspace::new();
     ws.write("stale.txt", "old");
@@ -577,6 +591,27 @@ fn shadow_mode_removes_files_only_the_fresh_run_created() {
     assert_eq!(shadowed.report["shadow"], "nondeterministic", "{}", shadowed.report);
     let left: Vec<_> = fs::read_dir(ws.path("out")).unwrap().map(|entry| entry.unwrap().file_name()).collect();
     assert_eq!(left, cached);
+}
+
+#[test]
+fn reading_a_file_the_cached_run_wrote_is_not_a_false_hit() {
+    let ws = Workspace::new();
+    ws.write("config.in", "v1");
+    ws.write("config.out", "v1");
+    let set_age = |name: &str, seconds_ago: u64| {
+        let file = fs::File::options().write(true).open(ws.path(name)).unwrap();
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(seconds_ago)).unwrap();
+    };
+    set_age("config.out", 200);
+    set_age("config.in", 100);
+    let build = "if [ config.in -nt config.out ]; then rm config.out; cp config.in config.out; fi; cat config.out > result";
+    assert_outcome(&ws.sh(build), "miss");
+
+    set_age("config.in", 300);
+    let shadowed = ws.run_with(&["sh", "-c", build], |c| {
+        c.arg("--shadow");
+    });
+    assert_eq!(shadowed.report["shadow"], "nondeterministic", "{}", shadowed.report);
 }
 
 #[test]

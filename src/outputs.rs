@@ -62,6 +62,12 @@ pub fn capture(recording: &Recording, store: &Store) -> Result<Vec<Output>> {
     Ok(outputs)
 }
 
+/// Restored outputs keep the order of their modification times, a microsecond
+/// apart and just before the restore: newer than the work tree they are restored
+/// into, as they were when the command made them, so make and cargo see them as
+/// up to date.
+const MODIFICATION_STEP: Duration = Duration::from_micros(1);
+
 /// Relies on outputs being sorted by path, so parents come before their children.
 pub fn restore(outputs: &[Output], store: &Store) -> Result<()> {
     let restored_at = SystemTime::now();
@@ -92,8 +98,13 @@ pub fn restore(outputs: &[Output], store: &Store) -> Result<()> {
             }
         }
     }
-    for output in outputs.iter().rev().filter(|output| output.state != OutputState::Deleted) {
-        let modified = restored_at.checked_sub(Duration::from_nanos(output.age_ns)).unwrap_or(UNIX_EPOCH);
+    let restored: Vec<&Output> = outputs.iter().rev().filter(|output| output.state != OutputState::Deleted).collect();
+    let mut ages: Vec<u64> = restored.iter().map(|output| output.age_ns).collect();
+    ages.sort_unstable_by(|a, b| b.cmp(a));
+    ages.dedup();
+    for output in restored {
+        let newer_ages = ages.partition_point(|&age| age > output.age_ns);
+        let modified = restored_at - MODIFICATION_STEP * (ages.len() - newer_ages) as u32;
         set_modified(&output.path, modified).with_context(|| format!("dating {}", output.path.display()))?;
     }
     Ok(())
@@ -267,6 +278,8 @@ mod tests {
 
         let modified = |path: &Path| fs::metadata(path).unwrap().modified().unwrap();
         assert!(modified(&older) < modified(&newer));
+        let restore_started = SystemTime::now() - Duration::from_millis(10);
+        assert!(modified(&older) > restore_started, "restored outputs must be newer than the work tree");
     }
 
     #[test]
