@@ -173,6 +173,14 @@ impl<'h> Recorder<'h> {
         })
     }
 
+    /// Setting a file's times leaves its content alone but changes the identity
+    /// that deferred hashing checks, so what was observed is hashed first.
+    pub fn before_times_change(&mut self, path: &Path, follows_symlinks: bool) {
+        let path = real_location(path);
+        let path = if follows_symlinks { resolve_symlinks(&path) } else { path };
+        self.settle_deferred_observations_of(&path);
+    }
+
     /// Linking changes the source's ctime, so its content is captured first.
     pub fn before_link(&mut self, source: &Path) {
         self.settle_deferred_observations_of(&real_location(source));

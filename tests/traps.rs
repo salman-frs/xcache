@@ -412,6 +412,17 @@ fn paths_that_are_not_utf8_are_cached_and_restored() {
 }
 
 #[test]
+fn touching_an_input_is_not_a_change_by_another_process() {
+    let ws = Workspace::new();
+    ws.write("in.txt", "one");
+    let script = "cat in.txt > out.txt && touch -c -d @1000000000 in.txt";
+    assert_outcome(&ws.sh(script), "miss");
+    ws.write("in.txt", "two");
+    assert_outcome(&ws.sh(script), "miss");
+    assert_eq!(ws.read("out.txt"), "two");
+}
+
+#[test]
 fn deletions_are_replayed() {
     let ws = Workspace::new();
     ws.write("stale.txt", "old");

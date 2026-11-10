@@ -94,16 +94,32 @@ pub fn external_peer(pid: Pid, destination: &Destination, tracees: &[Pid]) -> Op
 
 /// Taints a connection the command accepted unless it came from a process the
 /// command started itself.
-pub fn accepted_from_outside(pid: Pid, fd: i32, tracees: &[Pid]) -> Option<String> {
+/// `opened_by_command` holds the local ends of the connections the command
+/// opened, because a client may close its end before the server accepts.
+pub fn accepted_from_outside(
+    pid: Pid,
+    fd: i32,
+    tracees: &[Pid],
+    opened_by_command: &HashSet<SocketAddr>,
+) -> Option<String> {
     let inode = socket_inode(&fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?.to_string_lossy())?;
     let sockets = inet_sockets(pid);
     let accepted = sockets.iter().find(|socket| socket.inode == inode)?;
     if !accepted.remote.ip().is_loopback() {
         return Some(format!("accepted a connection from {}", accepted.remote));
     }
+    if opened_by_command.contains(&accepted.remote) {
+        return None;
+    }
     let owned = sockets_of(tracees);
     let from_command = sockets.iter().any(|socket| socket.local == accepted.remote && owned.contains(&socket.inode));
     (!from_command).then(|| format!("accepted a connection from a process it did not start ({})", accepted.remote))
+}
+
+/// The local address of an internet socket.
+pub fn local_address(pid: Pid, fd: i32) -> Option<SocketAddr> {
+    let inode = socket_inode(&fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?.to_string_lossy())?;
+    inet_sockets(pid).into_iter().find(|socket| socket.inode == inode).map(|socket| socket.local)
 }
 
 struct InetSocket {
@@ -249,8 +265,21 @@ mod tests {
         let (accepted, _) = listener.accept().unwrap();
         let me = nix::unistd::getpid();
         let fd = std::os::fd::AsRawFd::as_raw_fd(&accepted);
-        assert_eq!(accepted_from_outside(me, fd, &[me]), None);
-        assert!(accepted_from_outside(me, fd, &[]).is_some());
+        assert_eq!(accepted_from_outside(me, fd, &[me], &HashSet::new()), None);
+        assert!(accepted_from_outside(me, fd, &[], &HashSet::new()).is_some());
+    }
+
+    #[test]
+    fn connection_from_a_client_that_already_closed_is_not_external() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let me = nix::unistd::getpid();
+        let client_end = local_address(me, std::os::fd::AsRawFd::as_raw_fd(&client)).unwrap();
+        drop(client);
+        let (accepted, _) = listener.accept().unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&accepted);
+        assert!(accepted_from_outside(me, fd, &[me], &HashSet::new()).is_some());
+        assert_eq!(accepted_from_outside(me, fd, &[me], &HashSet::from([client_end])), None);
     }
 
     #[test]

@@ -3,10 +3,11 @@ mod net;
 mod syscalls;
 mod tracee;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsStr};
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -357,7 +358,7 @@ enum Pending {
     Rename { from: Mutation, to: Mutation },
     UntracedChild,
     Accept,
-    Connect(Destination),
+    Connect { fd: i32, destination: Destination },
 }
 
 enum Resume {
@@ -372,6 +373,7 @@ struct Tracer<'h> {
     root_exit: Option<Exit>,
     exec_seen: bool,
     untraced_children: Vec<Pid>,
+    opened_connections: HashSet<SocketAddr>,
 }
 
 impl<'h> Tracer<'h> {
@@ -383,6 +385,7 @@ impl<'h> Tracer<'h> {
             root_exit: None,
             exec_seen: false,
             untraced_children: Vec::new(),
+            opened_connections: HashSet::new(),
         }
     }
 
@@ -540,11 +543,12 @@ impl<'h> Tracer<'h> {
             Pending::UntracedChild if result > 0 => self.untraced_children.push(Pid::from_raw(result as i32)),
             Pending::Accept if result >= 0 => {
                 let tracees: Vec<Pid> = self.tracees.keys().copied().collect();
-                if let Some(reason) = net::accepted_from_outside(pid, result as i32, &tracees) {
+                if let Some(reason) = net::accepted_from_outside(pid, result as i32, &tracees, &self.opened_connections)
+                {
                     self.recorder.taint(reason);
                 }
             }
-            Pending::Connect(destination) => self.connected(pid, &destination, result),
+            Pending::Connect { fd, destination } => self.connected(pid, fd, &destination, result),
             Pending::Mutations(_) | Pending::Rename { .. } | Pending::UntracedChild | Pending::Accept => {}
         }
     }
@@ -628,12 +632,18 @@ impl<'h> Tracer<'h> {
             Call::Symlink { new_dirfd, new } => self.mutate(&[(path(new_dirfd, new)?, Effect::MakeLink)]),
             Call::Chmod { dirfd, path: address } => self.mutate(&[(path(dirfd, address)?, Effect::Chmod)]),
             Call::ChmodFd { fd } => self.mutate(&[(tracee::fd_path(pid, fd)?, Effect::Chmod)]),
+            Call::SetTimes { dirfd, path: address, flags } => {
+                let target = if address == 0 { tracee::fd_path(pid, dirfd)? } else { path(dirfd, address)? };
+                let follows_symlinks = flags & libc::AT_SYMLINK_NOFOLLOW as u64 == 0;
+                self.recorder.before_times_change(&target, follows_symlinks);
+                Resume::Continue
+            }
             Call::Truncate { path: address, length } => {
                 let effect = if length == 0 { Effect::TruncateToZero } else { Effect::Modify };
                 self.mutate(&[(path(libc::AT_FDCWD, address)?, effect)])
             }
-            Call::Connect { addr, len } => match net::read_sockaddr(pid, addr, len) {
-                Some(destination) => Resume::UntilExit(Pending::Connect(destination)),
+            Call::Connect { fd, addr, len } => match net::read_sockaddr(pid, addr, len) {
+                Some(destination) => Resume::UntilExit(Pending::Connect { fd, destination }),
                 None => Resume::Continue,
             },
             Call::SendTo { addr, len } => {
@@ -709,8 +719,14 @@ impl<'h> Tracer<'h> {
 
     /// A connection that failed reached no one. For a socket path, such as
     /// nscd's when nscd is not running, it showed whether the path exists.
-    fn connected(&mut self, pid: Pid, destination: &Destination, result: i64) {
+    fn connected(&mut self, pid: Pid, fd: i32, destination: &Destination, result: i64) {
         let found_nothing = matches!(-result as i32, libc::ENOENT | libc::ENOTDIR | libc::ECONNREFUSED);
+        if let Destination::Loopback { .. } = destination
+            && !found_nothing
+            && let Some(local) = net::local_address(pid, fd)
+        {
+            self.opened_connections.insert(local);
+        }
         match destination {
             Destination::UnixPath(path) if found_nothing => {
                 if let Some(path) = tracee::resolve(pid, libc::AT_FDCWD, path) {
