@@ -604,7 +604,8 @@ fn reading_a_file_the_cached_run_wrote_is_not_a_false_hit() {
     };
     set_age("config.out", 200);
     set_age("config.in", 100);
-    let build = "if [ config.in -nt config.out ]; then rm config.out; cp config.in config.out; fi; cat config.out > result";
+    let build =
+        "if [ config.in -nt config.out ]; then rm config.out; cp config.in config.out; fi; cat config.out > result";
     assert_outcome(&ws.sh(build), "miss");
 
     set_age("config.in", 300);
