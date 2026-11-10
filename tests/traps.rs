@@ -542,6 +542,21 @@ fn a_modification_time_the_command_chose_is_restored() {
 }
 
 #[test]
+fn a_time_chosen_within_the_run_is_restored_relative_to_it() {
+    let ws = Workspace::new();
+    ws.write("main.c", "int v;\n");
+    let build = "start=$(date +%s.%N); sleep 1; cp main.c main.o; touch -d @$start main.o.d";
+    let up_to_date = "if [ main.c -nt main.o.d ]; then echo stale; else echo fresh; fi";
+    assert_outcome(&ws.sh(build), "miss");
+
+    fs::remove_file(ws.path("main.o")).unwrap();
+    fs::remove_file(ws.path("main.o.d")).unwrap();
+    ws.write("main.c", "int v;\n");
+    assert_outcome(&ws.sh(build), "hit");
+    assert_eq!(ws.sh(up_to_date).stdout, "fresh\n");
+}
+
+#[test]
 fn deletions_are_replayed() {
     let ws = Workspace::new();
     ws.write("stale.txt", "old");

@@ -30,7 +30,7 @@ pub fn capture(recording: &Recording, store: &Store) -> Result<Vec<Output>> {
             .and_then(|meta| end_of_run.duration_since(meta.modified().ok()?).ok())
             .map_or(0, |age| age.as_nanos() as u64);
         let chosen_mtime_ns = match &meta {
-            Ok(meta) if recording.dated_outputs.contains(&path) => {
+            Ok(meta) if recording.dated_outputs.contains(&path) && !during(recording.started_at, end_of_run, meta) => {
                 Some(meta.mtime() * 1_000_000_000 + meta.mtime_nsec())
             }
             _ => None,
@@ -117,6 +117,14 @@ pub fn restore(outputs: &[Output], store: &Store) -> Result<()> {
         set_modified(&output.path, modified).with_context(|| format!("dating {}", output.path.display()))?;
     }
     Ok(())
+}
+
+/// A time chosen within the run, like cargo dating dep-info files to the start
+/// of the build, describes the run and is restored relative to it like any
+/// other. A time from before or after it, like `touch -d` or `cp -p` give, is
+/// restored as it is.
+fn during(started_at: SystemTime, ended_at: SystemTime, meta: &fs::Metadata) -> bool {
+    meta.modified().is_ok_and(|modified| started_at <= modified && modified <= ended_at)
 }
 
 fn since_epoch(nanoseconds: i64) -> SystemTime {

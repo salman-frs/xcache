@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::digest::ContentHasher;
 use crate::observe::{self, Access, EntryKind, State};
@@ -15,6 +16,7 @@ pub struct Recording {
     pub output_trees: BTreeSet<PathBuf>,
     /// Outputs whose modification time the command set to a chosen value last.
     pub dated_outputs: BTreeSet<PathBuf>,
+    pub started_at: SystemTime,
     pub taints: Vec<String>,
 }
 
@@ -96,6 +98,7 @@ pub struct Recorder<'h> {
     preexisting_outputs: BTreeSet<PathBuf>,
     output_trees: BTreeSet<PathBuf>,
     dated_outputs: BTreeSet<PathBuf>,
+    started_at: SystemTime,
     created: HashMap<PathBuf, HashSet<OsString>>,
     removed: HashMap<PathBuf, HashMap<OsString, EntryKind>>,
     taints: Vec<String>,
@@ -117,6 +120,7 @@ impl<'h> Recorder<'h> {
             preexisting_outputs: BTreeSet::new(),
             output_trees: BTreeSet::new(),
             dated_outputs: BTreeSet::new(),
+            started_at: SystemTime::now(),
             created: HashMap::new(),
             removed: HashMap::new(),
             taints: Vec::new(),
@@ -268,6 +272,7 @@ impl<'h> Recorder<'h> {
             preexisting_outputs: self.preexisting_outputs,
             output_trees: self.output_trees,
             dated_outputs: self.dated_outputs,
+            started_at: self.started_at,
             taints: self.taints,
         }
     }

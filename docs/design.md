@@ -162,7 +162,9 @@ drops compiler temporaries with random names.
 Restored files get modification times in the order the run left them, a
 microsecond apart just before the restore, so build tools see them as newer
 than the checkout they are restored into. A file whose time the command set to
-a chosen value last, as `touch -d` and `cp -p` do, gets that time back.
+a value from before or after the run, as `touch -d` and `cp -p` do, gets that
+time back. A time within the run, like cargo dating dep-info files to the start
+of the build, is about the run, and is restored in order with the rest.
 
 Restoring removes deleted paths first, deepest first, then creates
 directories, files and symlinks in path order. Files are written under a
