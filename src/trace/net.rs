@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -69,18 +69,51 @@ pub fn read_sockaddr(pid: Pid, address: u64, length: u64) -> Option<Destination>
     super::tracee::read_exact(pid, address, length).map(|bytes| parse_sockaddr(&bytes))
 }
 
+/// A socket of the command known to listen on a loopback port. Checking that
+/// it is still open takes one readlink, where finding it again means reading
+/// /proc/net and every descriptor of every traced process, for each datagram.
+pub struct KnownListeners {
+    by_port: HashMap<u16, OpenSocket>,
+}
+
+#[derive(Clone, Copy)]
+struct OpenSocket {
+    pid: Pid,
+    fd: i32,
+    inode: u64,
+}
+
+impl KnownListeners {
+    pub fn new() -> Self {
+        Self { by_port: HashMap::new() }
+    }
+
+    fn still_listening(&self, port: u16) -> bool {
+        self.by_port.get(&port).is_some_and(|socket| fd_socket_inode(socket.pid, socket.fd) == Some(socket.inode))
+    }
+}
+
 /// Peers that belong to the traced process tree are part of the command itself.
-pub fn external_peer(pid: Pid, destination: &Destination, tracees: &[Pid]) -> Option<String> {
+pub fn external_peer(
+    pid: Pid,
+    destination: &Destination,
+    tracees: &[Pid],
+    known: &mut KnownListeners,
+) -> Option<String> {
     let peer_sockets = match destination {
         Destination::Unspecified | Destination::Kernel => return None,
         Destination::Remote(address) => return Some(format!("network access to {address}")),
         Destination::Other(family) => return Some(format!("uses socket address family {family}")),
+        Destination::Loopback { port } if known.still_listening(*port) => return None,
         Destination::Loopback { port } => loopback_listeners(pid, *port),
         Destination::UnixPath(path) => unix_listeners(pid, path, false),
         Destination::UnixAbstract(name) => unix_listeners(pid, name, true),
     };
     let owned = sockets_of(tracees);
-    if peer_sockets.iter().any(|inode| owned.contains(inode)) {
+    if let Some(listener) = peer_sockets.iter().find_map(|inode| owned.get(inode)) {
+        if let Destination::Loopback { port } = destination {
+            known.by_port.insert(*port, *listener);
+        }
         return None;
     }
     Some(match destination {
@@ -112,7 +145,8 @@ pub fn accepted_from_outside(
         return None;
     }
     let owned = sockets_of(tracees);
-    let from_command = sockets.iter().any(|socket| socket.local == accepted.remote && owned.contains(&socket.inode));
+    let from_command =
+        sockets.iter().any(|socket| socket.local == accepted.remote && owned.contains_key(&socket.inode));
     (!from_command).then(|| format!("accepted a connection from a process it did not start ({})", accepted.remote))
 }
 
@@ -209,20 +243,27 @@ fn unix_listeners(pid: Pid, name: &[u8], is_abstract: bool) -> Vec<u64> {
     inodes
 }
 
-fn sockets_of(tracees: &[Pid]) -> HashSet<u64> {
-    let mut sockets = HashSet::new();
-    for pid in tracees {
+/// The sockets the traced processes hold, by inode.
+fn sockets_of(tracees: &[Pid]) -> HashMap<u64, OpenSocket> {
+    let mut sockets = HashMap::new();
+    for &pid in tracees {
         let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else {
             continue;
         };
         for fd in fds.flatten() {
-            let Ok(target) = fs::read_link(fd.path()) else {
+            let Some(fd) = fd.file_name().to_str().and_then(|name| name.parse().ok()) else {
                 continue;
             };
-            sockets.extend(socket_inode(&target.to_string_lossy()));
+            if let Some(inode) = fd_socket_inode(pid, fd) {
+                sockets.insert(inode, OpenSocket { pid, fd, inode });
+            }
         }
     }
     sockets
+}
+
+fn fd_socket_inode(pid: Pid, fd: i32) -> Option<u64> {
+    socket_inode(&fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?.to_string_lossy())
 }
 
 fn socket_inode(link: &str) -> Option<u64> {
@@ -287,7 +328,20 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let me = nix::unistd::getpid();
-        assert_eq!(external_peer(me, &Destination::Loopback { port }, &[me]), None);
-        assert!(external_peer(me, &Destination::Loopback { port }, &[]).is_some());
+        assert_eq!(external_peer(me, &Destination::Loopback { port }, &[me], &mut KnownListeners::new()), None);
+        assert!(external_peer(me, &Destination::Loopback { port }, &[], &mut KnownListeners::new()).is_some());
+    }
+
+    #[test]
+    fn a_known_listener_counts_only_while_it_is_open() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let me = nix::unistd::getpid();
+        let mut known = KnownListeners::new();
+        assert_eq!(external_peer(me, &Destination::Loopback { port }, &[me], &mut known), None);
+        assert!(known.still_listening(port));
+        drop(listener);
+        assert!(!known.still_listening(port));
+        assert!(external_peer(me, &Destination::Loopback { port }, &[me], &mut known).is_some());
     }
 }

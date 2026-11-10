@@ -286,6 +286,15 @@ fn a_socket_it_binds_renames_and_connects_to_is_its_own() {
 }
 
 #[test]
+fn many_datagrams_to_its_own_sockets_stay_fast() {
+    let ws = Workspace::new();
+    let script = "import resource, socket\nsoft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)\nresource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))\nsockets = []\nfor _ in range(2500):\n    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n    s.bind(('127.0.0.1', 0 if not sockets else sockets[0].getsockname()[1]))\n    sockets.append(s)\nfor s in sockets:\n    s.sendto(b'x', sockets[0].getsockname())";
+    let started = Instant::now();
+    assert_outcome(&ws.run(&["python3", "-c", script]), "miss");
+    assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
+}
+
+#[test]
 fn talking_to_its_own_local_server_is_cacheable() {
     let ws = Workspace::new();
     let script = "import socket\nserver = socket.create_server(('127.0.0.1', 0))\nclient = socket.create_connection(server.getsockname())\nprint('connected')";

@@ -374,6 +374,7 @@ struct Tracer<'h> {
     exec_seen: bool,
     untraced_children: Vec<Pid>,
     opened_connections: HashSet<SocketAddr>,
+    known_listeners: net::KnownListeners,
 }
 
 impl<'h> Tracer<'h> {
@@ -386,6 +387,7 @@ impl<'h> Tracer<'h> {
             exec_seen: false,
             untraced_children: Vec::new(),
             opened_connections: HashSet::new(),
+            known_listeners: net::KnownListeners::new(),
         }
     }
 
@@ -757,7 +759,7 @@ impl<'h> Tracer<'h> {
             return;
         }
         let tracees: Vec<Pid> = self.tracees.keys().copied().collect();
-        if let Some(reason) = net::external_peer(pid, destination, &tracees) {
+        if let Some(reason) = net::external_peer(pid, destination, &tracees, &mut self.known_listeners) {
             self.recorder.taint(reason);
         }
     }
