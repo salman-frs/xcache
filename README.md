@@ -1,0 +1,207 @@
+# xcache
+
+xcache is a cache for arbitrary commands. It runs a command under a system
+call tracer and records what the command looked at: the files it read, the
+paths it checked, the directories it listed. The next time the same command
+runs and none of that has changed, xcache restores the files the command wrote
+and replays its output instead of running it.
+
+Nothing needs to be configured. There are no cache keys to write and no list
+of inputs to keep up to date.
+
+xcache is early. It runs on Linux (x86_64 and aarch64), and the cache format
+and command line will change.
+
+## Installation
+
+There are no binaries yet. Build from source with Rust 1.88 or newer:
+
+```sh
+cargo install --path .
+```
+
+xcache needs Linux 5.3 or newer. It has been tested on 6.8.
+
+## Usage
+
+### Running a command
+
+Prefix a command with `xcache run --`:
+
+```sh
+xcache run -- make -j8
+xcache run -- cargo test
+xcache run -- npm run build
+```
+
+If the command has run before with the same arguments, working directory and
+environment, and every file it depended on is unchanged, xcache restores its
+result and prints something like
+`xcache: hit, restored 44 outputs (the original run took 1.6s)`. Otherwise it
+runs the command and records it. Either way the exit status is the command's.
+
+### Finding out why a command missed
+
+`xcache explain -- <command>` shows why a command would miss: for each cached
+result, the first input that no longer matches.
+
+### Checking the cache with shadow mode
+
+`xcache run --shadow -- <command>` runs the command even when it could be
+restored, and compares the two results. Use it for a while before trusting
+the cache with a new project. It reports one of:
+
+- `correct`: same files, same output, same exit status.
+- `nondeterministic`: the fresh run read exactly the same inputs but produced
+  different output. A date written to a log file, or the output of a parallel
+  `make` interleaving differently, looks like this.
+- `false_hit`: the fresh run depended on something the cached run didn't
+  record. That is a bug in xcache. Please open an issue with the `--report`
+  output.
+
+### Environment variables
+
+Variables that change on every CI run, such as `GITHUB_SHA`, `GITHUB_RUN_ID`,
+`PWD` and access tokens, are removed from the command's environment, so they
+can't cause a miss and the command can't depend on them. If a command needs
+one, pass it with `--pass-env GITHUB_SHA`; it then becomes part of the cache
+key.
+
+### GitHub Actions
+
+Until there is a remote cache, keep the cache directory between runs with
+`actions/cache`:
+
+```yaml
+- uses: actions/cache@v6
+  with:
+    path: ~/.cache/xcache
+    key: xcache-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+    restore-keys: xcache-${{ runner.os }}-${{ runner.arch }}-
+
+- run: npm ci
+- run: xcache run -- npm run build
+- run: xcache run -- npm test
+
+- run: xcache gc --max-size 2G
+  if: always()
+```
+
+`npm ci` is not wrapped because it downloads packages, and commands that use
+the network are never cached.
+
+### Cache location and size
+
+The cache is stored in `$XCACHE_DIR`, or `$XDG_CACHE_HOME/xcache`, or
+`~/.cache/xcache`.
+
+`xcache gc --max-size 2G` drops the least recently used results until the
+cache fits.
+
+`--report <file>` writes a JSON summary of a run: whether it hit, why it was
+not cached, how many inputs and outputs it had, and where the time went.
+
+## What is not cached
+
+A command still runs normally, but its result is not stored, when it:
+
+- exits with a non-zero status;
+- connects to the network, or to a local service it didn't start itself
+  (Docker, a database, `nscd`), or accepts a connection from one;
+- leaves processes running after it exits (xcache kills them);
+- creates namespaces, mounts filesystems, or calls `chroot`;
+- renames a directory it didn't create;
+- has one of its input files changed by another process while it runs.
+
+xcache prints the reason when this happens.
+
+## Known caveats
+
+- The clock and random numbers can't be traced. If a command writes a
+  timestamp into a file, a cache hit restores the old timestamp.
+- Reads under `/proc`, `/sys` and `/dev` (except `/dev/shm`) are not tracked.
+  CPU counts and cgroup limits count as properties of the machine.
+- Restored files get the recorded content and permissions, but the current
+  time and the current user as owner.
+- A miss is slower than running the command directly, because every traced
+  system call stops in xcache. See [Performance](#performance).
+- Many tools check whether their outputs exist, so in a working tree that
+  already has build output the first run misses once.
+- Build daemons (Gradle, Bazel, sccache) outlive the command that starts them,
+  so those runs are not cached.
+- If ptrace or seccomp filters are not allowed, as in some sandboxes, xcache
+  says so and runs the command without caching.
+
+## Performance
+
+We ran three projects through a simulated CI run, starting from a fresh
+checkout with empty `GOCACHE`, `GOPATH` and `target/` each time, on
+Ubuntu 24.04 (aarch64, 4 vCPUs):
+
+| Project | Steps | Without xcache | Miss | Hit |
+|---|---|---|---|---|
+| [google/uuid](https://github.com/google/uuid) | `go vet`, `go build`, `go test` | 6.0s | 9.8s | 0.48s |
+| xcache | `cargo build --release`, `cargo test --release --lib` | 29.9s | 36.6s | 0.56s |
+| [madler/zlib](https://github.com/madler/zlib) | `./configure`, `make -j4`, `make test` | 1.5s | 2.3s | 0.03s |
+
+Shadow mode found no false hits in these runs.
+
+## How it works
+
+Every way a process can learn about the filesystem goes through a system call.
+xcache starts the command under ptrace with a seccomp filter that stops it on
+the calls that read or change the filesystem, and lets everything else run.
+For each call it records an input (file content, whether a path exists, the
+names in a directory) or an output. Before a write reaches the kernel, it
+captures the state the command depended on, so a file that is read and then
+rewritten is recorded with its original content.
+
+Each stored result lists its inputs with the state they had. A lookup checks
+those states against the filesystem and restores the first result that
+matches.
+
+[docs/design.md](docs/design.md) has the details.
+
+## Roadmap
+
+The long-term goal is for every build and test step, in CI and on developer
+machines, to be cached this way and shared between machines, without anyone
+writing a cache key. Roughly in order:
+
+- A faster tracer based on seccomp user notifications, so a miss costs less
+  than 10% over an uncached run.
+- A remote cache using the
+  [Bazel Remote Execution API](https://github.com/bazelbuild/remote-apis), and
+  a GitHub Action.
+- Signed cache entries, and read-only access for untrusted pull requests.
+- A published false-hit rate from running shadow mode on popular projects.
+- [SLSA](https://slsa.dev/) provenance built from the recorded inputs.
+- macOS hosts.
+
+## Related work
+
+- [BuildXL](https://github.com/microsoft/BuildXL) uses observed file accesses
+  as cache keys. xcache applies the same idea to single commands.
+- [Rattle](https://github.com/ndmitchell/rattle) is a build system that learns
+  dependencies by tracing commands.
+- [ccache](https://ccache.dev/) and [sccache](https://github.com/mozilla/sccache)
+  cache compiler invocations.
+- Earthly's [ucacher](https://earthly.dev/blog/ucacher/) traced GitHub Actions
+  steps to skip them.
+
+## Development
+
+The tests need `sh`, `gcc`, `go` and `python3`:
+
+```sh
+cargo test
+```
+
+Most of the tests in [tests/traps.rs](tests/traps.rs) try to make xcache
+return a wrong result, for example with a header that shadows another on the
+include path or a file rewritten in place. A fix for a false hit should start
+with a new test there.
+
+## License
+
+Apache-2.0

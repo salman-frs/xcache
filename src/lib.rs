@@ -1,0 +1,12 @@
+#[cfg(not(target_os = "linux"))]
+compile_error!("xcache traces Linux system calls and only builds for Linux");
+
+pub mod cli;
+mod digest;
+mod invocation;
+mod observe;
+mod outputs;
+mod record;
+mod run;
+mod store;
+mod trace;

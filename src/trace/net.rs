@@ -1,0 +1,261 @@
+use std::collections::HashSet;
+use std::fs;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+use nix::unistd::Pid;
+
+const MAX_SOCKADDR: usize = 128;
+const TCP_LISTEN: &str = "0A";
+const UNIX_ACCEPTING: u32 = 0x0001_0000;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Destination {
+    Unspecified,
+    Kernel,
+    Loopback { port: u16 },
+    Remote(String),
+    UnixPath(Vec<u8>),
+    UnixAbstract(Vec<u8>),
+    Other(u16),
+}
+
+pub fn parse_sockaddr(bytes: &[u8]) -> Destination {
+    let Some(family) = bytes.get(..2).map(|family| u16::from_ne_bytes([family[0], family[1]])) else {
+        return Destination::Unspecified;
+    };
+    match i32::from(family) {
+        libc::AF_UNSPEC => Destination::Unspecified,
+        libc::AF_NETLINK => Destination::Kernel,
+        libc::AF_INET if bytes.len() >= 8 => {
+            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+            ip_destination(IpAddr::V4(Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7])), port)
+        }
+        libc::AF_INET6 if bytes.len() >= 24 => {
+            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+            let octets: [u8; 16] = bytes[8..24].try_into().unwrap();
+            ip_destination(IpAddr::V6(Ipv6Addr::from(octets)), port)
+        }
+        libc::AF_UNIX => {
+            let path = &bytes[2..];
+            match path.first() {
+                None => Destination::Unspecified,
+                Some(0) => Destination::UnixAbstract(trim_nul(&path[1..]).to_vec()),
+                Some(_) => Destination::UnixPath(trim_nul(path).to_vec()),
+            }
+        }
+        _ => Destination::Other(family),
+    }
+}
+
+fn ip_destination(ip: IpAddr, port: u16) -> Destination {
+    let loopback = match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+    };
+    if loopback { Destination::Loopback { port } } else { Destination::Remote(format!("{ip}:{port}")) }
+}
+
+fn trim_nul(bytes: &[u8]) -> &[u8] {
+    bytes.iter().position(|&byte| byte == 0).map_or(bytes, |end| &bytes[..end])
+}
+
+pub fn read_sockaddr(pid: Pid, address: u64, length: u64) -> Option<Destination> {
+    if address == 0 {
+        return None;
+    }
+    let length = (length as usize).min(MAX_SOCKADDR);
+    super::tracee::read_exact(pid, address, length).map(|bytes| parse_sockaddr(&bytes))
+}
+
+/// Peers that belong to the traced process tree are part of the command itself.
+pub fn external_peer(pid: Pid, destination: &Destination, tracees: &[Pid]) -> Option<String> {
+    let peer_sockets = match destination {
+        Destination::Unspecified | Destination::Kernel => return None,
+        Destination::Remote(address) => return Some(format!("network access to {address}")),
+        Destination::Other(family) => return Some(format!("uses socket address family {family}")),
+        Destination::Loopback { port } => loopback_listeners(pid, *port),
+        Destination::UnixPath(path) => unix_listeners(pid, path, false),
+        Destination::UnixAbstract(name) => unix_listeners(pid, name, true),
+    };
+    let owned = sockets_of(tracees);
+    if peer_sockets.iter().any(|inode| owned.contains(inode)) {
+        return None;
+    }
+    Some(match destination {
+        Destination::Loopback { port } => format!("connects to a local service it did not start (port {port})"),
+        Destination::UnixPath(path) => {
+            format!("connects to a local service it did not start ({})", String::from_utf8_lossy(path))
+        }
+        _ => "connects to a local service it did not start".to_owned(),
+    })
+}
+
+/// Taints a connection the command accepted unless it came from a process the
+/// command started itself.
+pub fn accepted_from_outside(pid: Pid, fd: i32, tracees: &[Pid]) -> Option<String> {
+    let inode = socket_inode(&fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?.to_string_lossy())?;
+    let sockets = inet_sockets(pid);
+    let accepted = sockets.iter().find(|socket| socket.inode == inode)?;
+    if !accepted.remote.ip().is_loopback() {
+        return Some(format!("accepted a connection from {}", accepted.remote));
+    }
+    let owned = sockets_of(tracees);
+    let from_command = sockets.iter().any(|socket| socket.local == accepted.remote && owned.contains(&socket.inode));
+    (!from_command).then(|| format!("accepted a connection from a process it did not start ({})", accepted.remote))
+}
+
+struct InetSocket {
+    local: SocketAddr,
+    remote: SocketAddr,
+    listening: bool,
+    inode: u64,
+}
+
+fn loopback_listeners(pid: Pid, port: u16) -> Vec<u64> {
+    inet_sockets(pid)
+        .into_iter()
+        .filter(|socket| socket.local.port() == port && socket.listening)
+        .map(|socket| socket.inode)
+        .collect()
+}
+
+fn inet_sockets(pid: Pid) -> Vec<InetSocket> {
+    let mut sockets = Vec::new();
+    for (table, connectionless) in [("tcp", false), ("tcp6", false), ("udp", true), ("udp6", true)] {
+        let Ok(contents) = fs::read_to_string(format!("/proc/{pid}/net/{table}")) else {
+            continue;
+        };
+        for line in contents.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let (Some(local), Some(remote), Some(state), Some(inode)) =
+                (fields.get(1), fields.get(2), fields.get(3), fields.get(9))
+            else {
+                continue;
+            };
+            let (Some(local), Some(remote), Ok(inode)) =
+                (parse_proc_address(local), parse_proc_address(remote), inode.parse())
+            else {
+                continue;
+            };
+            sockets.push(InetSocket { local, remote, listening: connectionless || *state == TCP_LISTEN, inode });
+        }
+    }
+    sockets
+}
+
+/// Parses `0100007F:1F90` (IPv4) or a 32-digit IPv6 address from /proc/net,
+/// where each 32-bit word is in host byte order. IPv4-mapped addresses are
+/// normalized to IPv4 so both ends of a connection compare equal.
+fn parse_proc_address(field: &str) -> Option<SocketAddr> {
+    let (address, port) = field.split_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    let word =
+        |index: usize| u32::from_str_radix(address.get(index * 8..index * 8 + 8)?, 16).ok().map(u32::to_ne_bytes);
+    let ip = match address.len() {
+        8 => IpAddr::V4(Ipv4Addr::from(word(0)?)),
+        32 => {
+            let mut octets = [0u8; 16];
+            for index in 0..4 {
+                octets[index * 4..index * 4 + 4].copy_from_slice(&word(index)?);
+            }
+            let v6 = Ipv6Addr::from(octets);
+            v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4)
+        }
+        _ => return None,
+    };
+    Some(SocketAddr::new(ip, port))
+}
+
+fn unix_listeners(pid: Pid, name: &[u8], is_abstract: bool) -> Vec<u64> {
+    let Ok(contents) = fs::read_to_string(format!("/proc/{pid}/net/unix")) else {
+        return Vec::new();
+    };
+    let expected = if is_abstract {
+        format!("@{}", String::from_utf8_lossy(name))
+    } else {
+        String::from_utf8_lossy(name).into_owned()
+    };
+    let mut inodes = Vec::new();
+    for line in contents.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let (Some(flags), Some(inode), Some(path)) = (fields.get(3), fields.get(6), fields.get(7)) else {
+            continue;
+        };
+        let flags = u32::from_str_radix(flags, 16).unwrap_or(0);
+        let is_stream_listener = flags & UNIX_ACCEPTING != 0;
+        let is_datagram = fields.get(4) == Some(&"0002");
+        if *path == expected && (is_stream_listener || is_datagram) {
+            inodes.extend(inode.parse::<u64>());
+        }
+    }
+    inodes
+}
+
+fn sockets_of(tracees: &[Pid]) -> HashSet<u64> {
+    let mut sockets = HashSet::new();
+    for pid in tracees {
+        let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let Ok(target) = fs::read_link(fd.path()) else {
+                continue;
+            };
+            sockets.extend(socket_inode(&target.to_string_lossy()));
+        }
+    }
+    sockets
+}
+
+fn socket_inode(link: &str) -> Option<u64> {
+    link.strip_prefix("socket:[")?.strip_suffix(']')?.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inet(ip: [u8; 4], port: u16) -> Vec<u8> {
+        let mut bytes = (libc::AF_INET as u16).to_ne_bytes().to_vec();
+        bytes.extend(port.to_be_bytes());
+        bytes.extend(ip);
+        bytes.extend([0; 8]);
+        bytes
+    }
+
+    #[test]
+    fn classifies_destinations() {
+        assert_eq!(parse_sockaddr(&inet([127, 0, 0, 1], 8080)), Destination::Loopback { port: 8080 });
+        assert_eq!(parse_sockaddr(&inet([1, 1, 1, 1], 53)), Destination::Remote("1.1.1.1:53".into()));
+
+        let mut unix = (libc::AF_UNIX as u16).to_ne_bytes().to_vec();
+        unix.extend(b"/run/docker.sock\0");
+        assert_eq!(parse_sockaddr(&unix), Destination::UnixPath(b"/run/docker.sock".to_vec()));
+    }
+
+    #[test]
+    fn parses_proc_net_addresses() {
+        assert_eq!(parse_proc_address("0100007F:1F90"), Some("127.0.0.1:8080".parse().unwrap()));
+        assert_eq!(parse_proc_address("0000000000000000FFFF00000100007F:0050"), Some("127.0.0.1:80".parse().unwrap()));
+    }
+
+    #[test]
+    fn connection_accepted_from_own_client_is_not_external() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        let me = nix::unistd::getpid();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&accepted);
+        assert_eq!(accepted_from_outside(me, fd, &[me]), None);
+        assert!(accepted_from_outside(me, fd, &[]).is_some());
+    }
+
+    #[test]
+    fn listener_in_own_process_is_not_external() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let me = nix::unistd::getpid();
+        assert_eq!(external_peer(me, &Destination::Loopback { port }, &[me]), None);
+        assert!(external_peer(me, &Destination::Loopback { port }, &[]).is_some());
+    }
+}
