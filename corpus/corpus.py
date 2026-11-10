@@ -2,7 +2,7 @@
 """Runs real projects' build and test steps under xcache and summarizes the results.
 
     corpus.py list [NAME...]                projects and their ecosystems, as JSON
-    corpus.py run --xcache BIN NAME...      measure projects, writing results/NAME.json
+    corpus.py run --xcache BIN NAME...      measure projects, writing results/NAME-ARCH.json
     corpus.py report results/*.json         write the summary as Markdown and JSON
 
 See docs/corpus.md for what each phase measures.
@@ -133,10 +133,12 @@ class Workspace:
         subprocess.run(["cp", "-a", str(self.home), str(self.home_snapshot)], check=True)
 
     def start_phase(self, phase: Phase) -> None:
+        """Each phase stands for a CI run on a new machine, where xcache's per-boot stat cache is empty."""
         remove_tree(self.home)
         subprocess.run(["cp", "-a", str(self.home_snapshot), str(self.home)], check=True)
         remove_tree(self.tmp)
         self.tmp.mkdir()
+        remove_tree(self.store / "stat-cache")
         self.check_out(phase.commit)
         for command in self.project.setup:
             self.shell(command, self.logs / f"{phase.name}.setup.log")
