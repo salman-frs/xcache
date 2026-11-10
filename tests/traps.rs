@@ -1,8 +1,10 @@
 //! Each test sets a trap for the cache: a change that a naive cache would miss.
 //! Tests need sh, gcc, go and python3 on PATH.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -374,6 +376,17 @@ fn retargeting_a_symlink_misses() {
     symlink("b.txt", ws.path("current")).unwrap();
     assert_outcome(&ws.sh("cat current > out.txt"), "miss");
     assert_eq!(ws.read("out.txt"), "b");
+}
+
+#[test]
+fn paths_that_are_not_utf8_are_cached_and_restored() {
+    let ws = Workspace::new();
+    let script = "printf data > \"$(printf 'caf\\351')\"";
+    assert_outcome(&ws.sh(script), "miss");
+    let name = OsStr::from_bytes(b"caf\xe9");
+    fs::remove_file(ws.root.join(name)).unwrap();
+    assert_outcome(&ws.sh(script), "hit");
+    assert_eq!(fs::read(ws.root.join(name)).unwrap(), b"data");
 }
 
 #[test]

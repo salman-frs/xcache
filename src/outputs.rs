@@ -23,9 +23,6 @@ pub fn capture(recording: &Recording, store: &Store) -> Result<Vec<Output>> {
     let mut first_name_of_inode: HashMap<(u64, u64), PathBuf> = HashMap::new();
     let mut outputs = Vec::with_capacity(paths.len());
     for path in paths {
-        if path.to_str().is_none() {
-            bail!("writes a path that is not valid UTF-8: {}", path.display());
-        }
         let meta = fs::symlink_metadata(&path);
         let age_ns = meta
             .as_ref()

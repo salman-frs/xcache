@@ -18,12 +18,14 @@ const COMPRESSION_LEVEL: i32 = 3;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Input {
     pub access: Access,
+    #[serde(with = "crate::path_serde")]
     pub path: PathBuf,
     pub state: State,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Output {
+    #[serde(with = "crate::path_serde")]
     pub path: PathBuf,
     pub state: OutputState,
     /// How long before the end of the run this was last modified. Restoring
@@ -46,9 +48,11 @@ pub enum OutputState {
     },
     /// Another name for an output earlier in path order.
     HardLink {
+        #[serde(with = "crate::path_serde")]
         target: PathBuf,
     },
     Symlink {
+        #[serde(with = "crate::path_serde")]
         target: PathBuf,
     },
 }

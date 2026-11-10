@@ -24,13 +24,35 @@ pub enum Access {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum State {
     Missing,
-    File { size: u64, mode: u32, content: Digest },
-    Dir { real_path: PathBuf, mode: u32 },
-    Listing { real_path: PathBuf, entries: Digest },
-    Symlink { target: PathBuf },
-    Writable { parent_is_dir: bool, is_dir: bool },
-    Special { kind: SpecialKind },
-    Error { errno: i32 },
+    File {
+        size: u64,
+        mode: u32,
+        content: Digest,
+    },
+    Dir {
+        #[serde(with = "crate::path_serde")]
+        real_path: PathBuf,
+        mode: u32,
+    },
+    Listing {
+        #[serde(with = "crate::path_serde")]
+        real_path: PathBuf,
+        entries: Digest,
+    },
+    Symlink {
+        #[serde(with = "crate::path_serde")]
+        target: PathBuf,
+    },
+    Writable {
+        parent_is_dir: bool,
+        is_dir: bool,
+    },
+    Special {
+        kind: SpecialKind,
+    },
+    Error {
+        errno: i32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
