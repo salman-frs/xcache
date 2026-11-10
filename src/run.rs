@@ -385,10 +385,9 @@ fn differences(cached: &RunResult, fresh: &RunResult) -> Vec<String> {
 fn describe(state: &State) -> String {
     match state {
         State::Missing => "missing".into(),
-        State::File { size, mode, content: Some(content) } => {
+        State::File { size, mode, content } => {
             format!("{size}-byte file {} with mode {mode:o}", &content.to_hex()[..12])
         }
-        State::File { size, mode, content: None } => format!("{size}-byte file with mode {mode:o}"),
         State::Dir { real_path, mode } => format!("directory {} with mode {mode:o}", real_path.display()),
         State::Listing { entries, .. } => format!("listing {}", &entries.to_hex()[..12]),
         State::Symlink { target } => format!("symlink to {}", target.display()),

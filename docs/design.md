@@ -47,10 +47,18 @@ the corresponding system calls can tell the command (`observe.rs`):
 | Access | Comes from | Recorded state |
 |---|---|---|
 | `read` | `open` for reading, `execve`, files mapped by `execve` | content (BLAKE3), size, permission bits |
-| `stat` | `stat`, `statx`, `access`, `chdir`, `open(O_PATH)` | type, size, permission bits |
+| `stat` | `stat`, `statx`, `access`, `chdir`, `open(O_PATH)` | type, permission bits; size and content for a file |
 | `lstat` | `lstat`, `readlink`, `AT_SYMLINK_NOFOLLOW`, `O_NOFOLLOW` | as `stat`, or the target of a symlink |
 | `list` | `getdents64` | names and types of the entries |
 | `writable` | create with truncation | whether the parent is a directory, whether the path is one |
+
+A `stat` can't see a file's content, but it does see its modification time,
+and make, ninja, git and Python's bytecode cache decide what to do by comparing
+those times. A command that found `main.o` newer than `main.c` and did nothing
+would otherwise hit after `main.c` was edited to different content of the same
+size. Times change on every checkout, so they can't be part of the key. A file's
+content is recorded instead: when it is unchanged, so is anything the command
+could have derived from its time, as long as the command is deterministic.
 
 A path that doesn't exist is recorded as missing. This matters for search
 paths: a compiler that finds `config.h` in its fifth include directory has
@@ -70,13 +78,13 @@ lookup sees the change. Paths under `/proc` are resolved first, because
 ### Deferred hashing
 
 Hashing each file when it is opened would stall the command. Instead, a read
-records the file's device, inode, size, mtime and ctime, and the content is
-hashed after the command exits. If those have changed by then, another process
+or `stat` of a file records its device, inode, size, mtime and ctime, and the
+content is hashed after the command exits. If those have changed by then, another process
 modified the file during the run, and the result is not stored.
 
 If the command itself writes to a file it read earlier, the pending hash is
 computed before the write goes through, so the recorded content is what the
-command read (`record.rs`, `settle_deferred_reads_of`).
+command read (`record.rs`, `settle_deferred_observations_of`).
 
 ## Writes
 

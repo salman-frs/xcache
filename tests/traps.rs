@@ -426,6 +426,26 @@ fn shadow_mode_confirms_hits_and_catches_nondeterminism() {
 }
 
 #[test]
+fn a_same_size_edit_behind_a_modification_time_check_misses() {
+    let ws = Workspace::new();
+    ws.write("main.c", "int v = 1;\n");
+    ws.write("main.o", "int v = 1;\n");
+    let set_age = |name: &str, seconds_ago: u64| {
+        let file = fs::File::options().write(true).open(ws.path(name)).unwrap();
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(seconds_ago)).unwrap();
+    };
+    set_age("main.c", 200);
+    set_age("main.o", 100);
+    let make = "if [ main.c -nt main.o ]; then cp main.c main.o; fi";
+    assert_outcome(&ws.sh(make), "miss");
+    assert_outcome(&ws.sh(make), "hit");
+
+    ws.write("main.c", "int v = 2;\n");
+    assert_outcome(&ws.sh(make), "miss");
+    assert_eq!(ws.read("main.o"), "int v = 2;\n");
+}
+
+#[test]
 fn shadow_mode_leaves_what_a_hit_would_so_later_commands_see_the_same_files() {
     let ws = Workspace::new();
     let stamp = ["sh", "-c", "date +%s%N > stamp.txt"];

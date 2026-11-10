@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::digest::Digest;
 use crate::observe::{Access, State};
 
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 const ENTRIES_PER_COMMAND: usize = 16;
 const COMPRESSION_LEVEL: i32 = 3;
 
