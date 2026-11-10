@@ -154,6 +154,9 @@ appears there later.
   system call stops in xcache. See [Performance](#performance).
 - Many tools check whether their outputs exist, so in a working tree that
   already has build output the first run misses once.
+- For a build script without `rerun-if-changed`, cargo stores the newest
+  modification time of the package's files. After a hit in a fresh checkout,
+  a cargo command that misses reruns that package's build script once.
 - Build daemons (Gradle, Bazel, sccache) outlive the command that starts them,
   so those runs are not cached. Run Gradle without them:
   `./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process build`.
@@ -162,17 +165,17 @@ appears there later.
 
 ## Performance
 
-We ran three projects through a simulated CI run, starting from a fresh
-checkout with empty `GOCACHE`, `GOPATH` and `target/` each time, on
-Ubuntu 24.04 (aarch64, 4 vCPUs):
+The [shadow corpus](docs/corpus.md) runs the build and test steps of 29 open
+source projects (Go, Rust, Node, Python, Gradle and CMake) from fresh checkouts
+on GitHub's x86_64 and aarch64 runners. In the [latest
+results](docs/corpus-results.md):
 
-| Project | Steps | Without xcache | Miss | Hit |
-|---|---|---|---|---|
-| [google/uuid](https://github.com/google/uuid) | `go vet`, `go build`, `go test` | 6.0s | 9.8s | 0.48s |
-| xcache | `cargo build --release`, `cargo test --release --lib` | 29.9s | 36.6s | 0.56s |
-| [madler/zlib](https://github.com/madler/zlib) | `./configure`, `make -j4`, `make test` | 1.5s | 2.3s | 0.03s |
-
-Shadow mode found no false hits in these runs.
+- 93% of steps are cacheable, and all of those hit from a fresh checkout of the
+  same commit.
+- A miss takes 21% longer than running the command directly (median), from +8%
+  for CMake to +29% for Gradle.
+- A hit is 15x to 48x faster than running the step (median per ecosystem).
+- Shadow mode found no wrong result.
 
 ## How it works
 
@@ -202,7 +205,6 @@ writing a cache key. Roughly in order:
   [Bazel Remote Execution API](https://github.com/bazelbuild/remote-apis), and
   a GitHub Action.
 - Signed cache entries, and read-only access for untrusted pull requests.
-- A published false-hit rate from running shadow mode on popular projects.
 - [SLSA](https://slsa.dev/) provenance built from the recorded inputs.
 - macOS hosts.
 

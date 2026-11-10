@@ -399,7 +399,7 @@ def distinct_reasons(reasons: list[str]) -> list[str]:
 
 def decision(false_hits: int, cacheable_share: float) -> str:
     if false_hits:
-        return "Fix the false hits before anything else."
+        return "Investigate the false hits shadow mode reported, and fix any wrong result, before anything else."
     if cacheable_share < 0.4:
         return "Raise the share of cacheable steps first (network allowlists, daemon support)."
     if cacheable_share > 0.6:

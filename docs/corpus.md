@@ -5,6 +5,7 @@ projects, so we know whether it is correct and worth using on real builds. The
 projects are listed in [corpus/projects.toml](../corpus/projects.toml), pinned
 to a commit, and the [Corpus workflow](../.github/workflows/corpus.yml) runs
 each of them on x86_64 and aarch64 every week and whenever the corpus changes.
+[corpus-results.md](corpus-results.md) has the latest results.
 
 ## What a run does
 
