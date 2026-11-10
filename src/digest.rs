@@ -101,7 +101,7 @@ struct Known {
 }
 
 const PARALLEL_HASHING_MIN: u64 = 4 << 20;
-const PARALLEL_HASHING_CHUNK: usize = 16 << 20;
+const PARALLEL_HASHING_CHUNK: usize = 4 << 20;
 const CACHE_MAGIC: &[u8] = b"xcache-stat-v2\n";
 const RECORD_LEN: usize = 8 * 7 + 32;
 const MAX_KNOWN: usize = 500_000;
@@ -142,6 +142,10 @@ impl ContentHasher {
 
     /// Hashes files on all CPUs, so the `hash_file` calls that follow are lookups.
     pub fn prefetch(&mut self, paths: &[&Path]) {
+        let mut paths = paths.to_vec();
+        paths.sort_unstable();
+        paths.dedup();
+        let paths = paths.as_slice();
         let next = AtomicUsize::new(0);
         let workers = thread::available_parallelism().map_or(1, NonZeroUsize::get).min(paths.len());
         let known = &self.known;

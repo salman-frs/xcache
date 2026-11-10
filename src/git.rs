@@ -18,7 +18,9 @@ const OID_LEN: usize = 20;
 const CHECKSUM_LEN: usize = 20;
 const EXTENDED_FLAG: u16 = 0x4000;
 const NAME_LENGTH_MASK: u16 = 0x0fff;
-const STAT_EXTENSIONS: [&[u8]; 4] = [b"UNTR", b"FSMN", b"EOIE", b"IEOT"];
+/// Offsets into the index itself, which follow from the entries. The untracked
+/// cache stays in: git trusts its listings while directory times match.
+const DERIVED_EXTENSIONS: [&[u8]; 2] = [b"EOIE", b"IEOT"];
 
 enum Bookkeeping {
     Index,
@@ -124,7 +126,7 @@ fn index_digest(bytes: &[u8]) -> Option<Digest> {
         let signature = reader.take(4)?;
         let length = u32::from_be_bytes(reader.take(4)?.try_into().ok()?) as usize;
         let data = reader.take(length)?;
-        if !STAT_EXTENSIONS.contains(&signature) {
+        if !DERIVED_EXTENSIONS.contains(&signature) {
             hasher.update(signature);
             hasher.update(&(length as u64).to_le_bytes());
             hasher.update(data);

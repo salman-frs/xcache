@@ -66,10 +66,13 @@ inode, times and size of every tracked file, and the reflogs (`.git/logs/`)
 record who moved HEAD and when, with an identity that names the machine when no
 user is configured. Two checkouts of the same commit differ in both, and cargo
 and `go build` read them on every build. The index digest covers the paths,
-modes, object IDs and flags of its entries, and the extensions other than the
-untracked and fsmonitor caches; a reflog digest covers each entry's object IDs
-and message (`git.rs`). Git uses the index's stat data only to skip re-reading
-work tree files, and those files are inputs by content.
+modes, object IDs and flags of its entries, and its extensions except the
+offset tables that follow from the entries; a reflog digest covers each entry's
+object IDs and message (`git.rs`). Git uses the entries' stat data only to skip
+re-reading work tree files, and those files are inputs by content. The
+untracked cache (`core.untrackedCache`) is different: git trusts its listings
+while directory times match, so it stays in the digest, and checkouts that use
+it miss.
 
 A path that doesn't exist is recorded as missing. This matters for search
 paths: a compiler that finds `config.h` in its fifth include directory has
@@ -251,8 +254,10 @@ When the result is `correct` or `nondeterministic`, xcache restores the cached
 outputs and exits with the cached status, as a hit would. Otherwise every
 nondeterministic command would change the inputs of the commands after it, and
 those commands would miss under `--shadow` where they hit without it, so their
-hits would never be checked. A false hit keeps the fresh result, and the entry
-that produced it is removed so that later runs can't reuse it.
+hits would never be checked. Files only the fresh run created are removed, but
+a file it changed that the cached run left alone keeps the change, since its
+earlier content was not stored. A false hit keeps the fresh result, and the
+entry that produced it is removed so that later runs can't reuse it.
 
 ## Store
 

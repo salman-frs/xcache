@@ -551,7 +551,8 @@ impl<'h> Tracer<'h> {
             Pending::UntracedChild if result > 0 => self.untraced_children.push(Pid::from_raw(result as i32)),
             Pending::Accept if result >= 0 => {
                 let tracees: Vec<Pid> = self.tracees.keys().copied().collect();
-                if let Some(reason) = net::accepted_from_outside(pid, result as i32, &tracees, &self.opened_connections)
+                if let Some(reason) =
+                    net::accepted_from_outside(pid, result as i32, &tracees, &mut self.opened_connections)
                 {
                     self.recorder.taint(reason);
                 }
@@ -764,12 +765,12 @@ impl<'h> Tracer<'h> {
                     self.recorder.observe(Access::Stat, &path);
                 }
             }
-            Destination::Loopback { port: 0 } => {}
-            Destination::Loopback { port } if -result == libc::ECONNREFUSED as i64 => {
-                self.recorder.observe(Access::Listen, &net::port_key(false, *port));
+            Destination::Loopback { port: 0, .. } => {}
+            Destination::Loopback { ip, port } if -result == libc::ECONNREFUSED as i64 => {
+                self.recorder.observe(Access::Listen, &net::port_key(false, SocketAddr::new(*ip, *port)));
             }
-            Destination::Loopback { port } if net::datagram_to_nobody(pid, fd, *port) => {
-                self.recorder.observe(Access::Listen, &net::port_key(true, *port));
+            Destination::Loopback { ip, port } if net::datagram_to_nobody(pid, fd, *port) => {
+                self.recorder.observe(Access::Listen, &net::port_key(true, SocketAddr::new(*ip, *port)));
             }
             _ => self.check_destination(pid, destination),
         }

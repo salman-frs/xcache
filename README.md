@@ -148,7 +148,8 @@ appears there later.
   time: make, ninja and git compare times, and times change on every checkout.
   Touching a file without changing it doesn't cause a miss.
 - Git's index and reflogs are compared without the stat data, times and
-  identities they keep about the checkout.
+  identities they keep about the checkout. Like the clock, a command that
+  prints reflog dates or names gets the cached ones on a hit.
 - A miss is slower than running the command directly, because every traced
   system call stops in xcache. See [Performance](#performance).
 - Many tools check whether their outputs exist, so in a working tree that

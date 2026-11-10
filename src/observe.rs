@@ -19,7 +19,7 @@ pub enum Access {
     Lstat,
     List,
     Writable,
-    /// Whether anything is bound to a loopback port, named `tcp:PORT` or `udp:PORT`.
+    /// Whether anything is bound to a loopback address, named like `tcp:127.0.0.1:8080`.
     Listen,
 }
 

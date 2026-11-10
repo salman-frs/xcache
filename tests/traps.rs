@@ -329,6 +329,21 @@ fn a_link_it_makes_to_another_service_is_not_its_own() {
 }
 
 #[test]
+fn a_service_on_another_loopback_address_does_not_stand_for_this_one() {
+    let ws = Workspace::new();
+    let elsewhere = std::net::TcpListener::bind("127.0.0.2:0").unwrap();
+    let port = elsewhere.local_addr().unwrap().port();
+    let script = format!(
+        "import socket\ntry: socket.create_connection(('127.0.0.1', {port}))\nexcept OSError: print('refused')"
+    );
+    assert_outcome(&ws.run(&["python3", "-c", &script]), "miss");
+
+    let _here = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let run = ws.run(&["python3", "-c", &script]);
+    assert_outcome(&run, "not_cached");
+}
+
+#[test]
 fn talking_to_its_own_local_server_is_cacheable() {
     let ws = Workspace::new();
     let script = "import socket\nserver = socket.create_server(('127.0.0.1', 0))\nclient = socket.create_connection(server.getsockname())\nprint('connected')";

@@ -13,7 +13,7 @@ const UNIX_ACCEPTING: u32 = 0x0001_0000;
 pub enum Destination {
     Unspecified,
     Kernel,
-    Loopback { port: u16 },
+    Loopback { ip: IpAddr, port: u16 },
     Remote(String),
     UnixPath(Vec<u8>),
     UnixAbstract(Vec<u8>),
@@ -55,7 +55,7 @@ fn ip_destination(ip: IpAddr, port: u16) -> Destination {
         IpAddr::V4(v4) => local(v4),
         IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified() || v6.to_ipv4_mapped().is_some_and(local),
     };
-    if loopback { Destination::Loopback { port } } else { Destination::Remote(format!("{ip}:{port}")) }
+    if loopback { Destination::Loopback { ip, port } } else { Destination::Remote(format!("{ip}:{port}")) }
 }
 
 fn trim_nul(bytes: &[u8]) -> &[u8] {
@@ -105,20 +105,20 @@ pub fn external_peer(
         Destination::Unspecified | Destination::Kernel => return None,
         Destination::Remote(address) => return Some(format!("network access to {address}")),
         Destination::Other(family) => return Some(format!("uses socket address family {family}")),
-        Destination::Loopback { port } if known.still_listening(*port) => return None,
-        Destination::Loopback { port } => loopback_listeners(pid, *port),
+        Destination::Loopback { port, .. } if known.still_listening(*port) => return None,
+        Destination::Loopback { port, .. } => loopback_listeners(pid, *port),
         Destination::UnixPath(path) => unix_listeners(pid, path, false),
         Destination::UnixAbstract(name) => unix_listeners(pid, name, true),
     };
     let owned = sockets_of(tracees);
     if let Some(listener) = peer_sockets.iter().find_map(|inode| owned.get(inode)) {
-        if let Destination::Loopback { port } = destination {
+        if let Destination::Loopback { port, .. } = destination {
             known.by_port.insert(*port, *listener);
         }
         return None;
     }
     Some(match destination {
-        Destination::Loopback { port } => format!("connects to a local service it did not start (port {port})"),
+        Destination::Loopback { port, .. } => format!("connects to a local service it did not start (port {port})"),
         Destination::UnixPath(path) => {
             format!("connects to a local service it did not start ({})", String::from_utf8_lossy(path))
         }
@@ -134,7 +134,7 @@ pub fn accepted_from_outside(
     pid: Pid,
     fd: i32,
     tracees: &[Pid],
-    opened_by_command: &HashSet<SocketAddr>,
+    opened_by_command: &mut HashSet<SocketAddr>,
 ) -> Option<String> {
     let inode = socket_inode(&fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?.to_string_lossy())?;
     let sockets = inet_sockets(pid);
@@ -142,7 +142,7 @@ pub fn accepted_from_outside(
     if !accepted.remote.ip().is_loopback() {
         return Some(format!("accepted a connection from {}", accepted.remote));
     }
-    if opened_by_command.contains(&accepted.remote) {
+    if opened_by_command.remove(&accepted.remote) {
         return None;
     }
     let owned = sockets_of(tracees);
@@ -165,27 +165,28 @@ struct InetSocket {
     inode: u64,
 }
 
-/// The path of a `listen` input for a loopback port.
-pub fn port_key(datagram: bool, port: u16) -> PathBuf {
-    PathBuf::from(format!("{}:{port}", if datagram { "udp" } else { "tcp" }))
+/// The path of a `listen` input: a protocol and a loopback address.
+pub fn port_key(datagram: bool, address: SocketAddr) -> PathBuf {
+    PathBuf::from(format!("{}:{address}", if datagram { "udp" } else { "tcp" }))
 }
 
-/// Whether anything is bound to the port a `listen` input names, or None if
-/// the key is not one.
+/// Whether anything is bound where a `listen` input points, or None if the key
+/// is not one. A socket bound to the unspecified address takes connections to
+/// any address on its port.
 pub fn is_bound(key: &Path) -> Option<bool> {
-    let (protocol, port) = key.to_str()?.split_once(':')?;
-    let port: u16 = port.parse().ok()?;
+    let (protocol, address) = key.to_str()?.split_once(':')?;
+    let address: SocketAddr = address.parse().ok()?;
     let datagram = match protocol {
         "udp" => true,
         "tcp" => false,
         _ => return None,
     };
+    let reaches = |local: SocketAddr| {
+        local.port() == address.port()
+            && (local.ip() == address.ip() || local.ip().is_unspecified() || address.ip().is_unspecified())
+    };
     let sockets = inet_sockets(nix::unistd::getpid());
-    Some(
-        sockets
-            .iter()
-            .any(|socket| socket.connectionless == datagram && socket.local.port() == port && socket.listening),
-    )
+    Some(sockets.iter().any(|socket| socket.connectionless == datagram && socket.listening && reaches(socket.local)))
 }
 
 /// Whether `fd` is a datagram socket and no other socket is bound to `port`.
@@ -326,9 +327,15 @@ mod tests {
 
     #[test]
     fn classifies_destinations() {
-        assert_eq!(parse_sockaddr(&inet([127, 0, 0, 1], 8080)), Destination::Loopback { port: 8080 });
+        assert_eq!(
+            parse_sockaddr(&inet([127, 0, 0, 1], 8080)),
+            Destination::Loopback { ip: Ipv4Addr::LOCALHOST.into(), port: 8080 }
+        );
         assert_eq!(parse_sockaddr(&inet([1, 1, 1, 1], 53)), Destination::Remote("1.1.1.1:53".into()));
-        assert_eq!(parse_sockaddr(&inet([0, 0, 0, 0], 9123)), Destination::Loopback { port: 9123 });
+        assert_eq!(
+            parse_sockaddr(&inet([0, 0, 0, 0], 9123)),
+            Destination::Loopback { ip: Ipv4Addr::UNSPECIFIED.into(), port: 9123 }
+        );
 
         let mut unix = (libc::AF_UNIX as u16).to_ne_bytes().to_vec();
         unix.extend(b"/run/docker.sock\0");
@@ -348,8 +355,8 @@ mod tests {
         let (accepted, _) = listener.accept().unwrap();
         let me = nix::unistd::getpid();
         let fd = std::os::fd::AsRawFd::as_raw_fd(&accepted);
-        assert_eq!(accepted_from_outside(me, fd, &[me], &HashSet::new()), None);
-        assert!(accepted_from_outside(me, fd, &[], &HashSet::new()).is_some());
+        assert_eq!(accepted_from_outside(me, fd, &[me], &mut HashSet::new()), None);
+        assert!(accepted_from_outside(me, fd, &[], &mut HashSet::new()).is_some());
     }
 
     #[test]
@@ -361,8 +368,8 @@ mod tests {
         drop(client);
         let (accepted, _) = listener.accept().unwrap();
         let fd = std::os::fd::AsRawFd::as_raw_fd(&accepted);
-        assert!(accepted_from_outside(me, fd, &[me], &HashSet::new()).is_some());
-        assert_eq!(accepted_from_outside(me, fd, &[me], &HashSet::from([client_end])), None);
+        assert!(accepted_from_outside(me, fd, &[me], &mut HashSet::new()).is_some());
+        assert_eq!(accepted_from_outside(me, fd, &[me], &mut HashSet::from([client_end])), None);
     }
 
     #[test]
@@ -370,8 +377,24 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let me = nix::unistd::getpid();
-        assert_eq!(external_peer(me, &Destination::Loopback { port }, &[me], &mut KnownListeners::new()), None);
-        assert!(external_peer(me, &Destination::Loopback { port }, &[], &mut KnownListeners::new()).is_some());
+        assert_eq!(
+            external_peer(
+                me,
+                &Destination::Loopback { ip: Ipv4Addr::LOCALHOST.into(), port },
+                &[me],
+                &mut KnownListeners::new()
+            ),
+            None
+        );
+        assert!(
+            external_peer(
+                me,
+                &Destination::Loopback { ip: Ipv4Addr::LOCALHOST.into(), port },
+                &[],
+                &mut KnownListeners::new()
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -380,10 +403,16 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let me = nix::unistd::getpid();
         let mut known = KnownListeners::new();
-        assert_eq!(external_peer(me, &Destination::Loopback { port }, &[me], &mut known), None);
+        assert_eq!(
+            external_peer(me, &Destination::Loopback { ip: Ipv4Addr::LOCALHOST.into(), port }, &[me], &mut known),
+            None
+        );
         assert!(known.still_listening(port));
         drop(listener);
         assert!(!known.still_listening(port));
-        assert!(external_peer(me, &Destination::Loopback { port }, &[me], &mut known).is_some());
+        assert!(
+            external_peer(me, &Destination::Loopback { ip: Ipv4Addr::LOCALHOST.into(), port }, &[me], &mut known)
+                .is_some()
+        );
     }
 }
