@@ -26,15 +26,31 @@ pub struct Input {
 pub struct Output {
     pub path: PathBuf,
     pub state: OutputState,
+    /// How long before the end of the run this was last modified. Restoring
+    /// keeps the order of modification times, which make and cargo compare.
+    #[serde(default)]
+    pub age_ns: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OutputState {
     Deleted,
-    Dir { mode: u32 },
-    File { mode: u32, size: u64, content: Digest },
-    Symlink { target: PathBuf },
+    Dir {
+        mode: u32,
+    },
+    File {
+        mode: u32,
+        size: u64,
+        content: Digest,
+    },
+    /// Another name for an output earlier in path order.
+    HardLink {
+        target: PathBuf,
+    },
+    Symlink {
+        target: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -349,6 +365,7 @@ mod tests {
         let output = Output {
             path: "/out".into(),
             state: OutputState::File { mode: 0o644, size: payload.len() as u64, content },
+            age_ns: 0,
         };
         let result = RunResult { exit_code: 0, stdio: store.put_bytes(b"").unwrap(), outputs: vec![output] };
         let inputs =

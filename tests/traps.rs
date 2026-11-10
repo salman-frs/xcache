@@ -506,6 +506,22 @@ fn shadow_mode_leaves_what_a_hit_would_so_later_commands_see_the_same_files() {
 }
 
 #[test]
+fn shadow_mode_removes_files_only_the_fresh_run_created() {
+    let ws = Workspace::new();
+    let script = "mkdir -p out && touch out/$(date +%s%N)";
+    assert_outcome(&ws.sh(script), "miss");
+    let cached: Vec<_> = fs::read_dir(ws.path("out")).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+    fs::remove_dir_all(ws.path("out")).unwrap();
+
+    let shadowed = ws.run_with(&["sh", "-c", script], |c| {
+        c.arg("--shadow");
+    });
+    assert_eq!(shadowed.report["shadow"], "nondeterministic", "{}", shadowed.report);
+    let left: Vec<_> = fs::read_dir(ws.path("out")).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+    assert_eq!(left, cached);
+}
+
+#[test]
 fn a_fresh_failure_with_the_same_inputs_is_nondeterministic_not_a_false_hit() {
     let ws = Workspace::new();
     let counter = ws.store.path().join("runs");

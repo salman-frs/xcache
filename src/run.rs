@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::process::ExitStatusExt;
@@ -72,6 +72,8 @@ enum ShadowVerdict {
 struct Execution {
     exit_code: i32,
     inputs: Vec<Input>,
+    /// Paths that did not exist before the run and were written by it.
+    created: BTreeSet<PathBuf>,
     result: Option<RunResult>,
     reasons: Vec<String>,
     traced: bool,
@@ -164,7 +166,7 @@ pub fn run(options: RunOptions) -> Result<i32> {
             }
         }
         if verdict != ShadowVerdict::FalseHit {
-            match leave_cached_result(verdict, cached, &store) {
+            match leave_cached_result(verdict, cached, &execution, &store) {
                 Ok(()) => {
                     let _ = store.mark_used(fingerprint, cached.created_at);
                     let _ = hasher.save();
@@ -237,6 +239,7 @@ fn execute(invocation: &Invocation, store: &Store, hasher: &mut ContentHasher) -
             Ok(Execution {
                 exit_code,
                 inputs: Vec::new(),
+                created: BTreeSet::new(),
                 result: None,
                 reasons: vec![reason],
                 traced: false,
@@ -251,6 +254,7 @@ fn execute(invocation: &Invocation, store: &Store, hasher: &mut ContentHasher) -
             Ok(Execution {
                 exit_code,
                 inputs: Vec::new(),
+                created: BTreeSet::new(),
                 result: None,
                 reasons: vec![error.to_string()],
                 traced: true,
@@ -280,9 +284,11 @@ fn execute(invocation: &Invocation, store: &Store, hasher: &mut ContentHasher) -
                 hashing: traced.hashing_time.as_millis() as u64,
                 store: storing.elapsed().as_millis() as u64,
             };
+            let created = traced.recording.outputs.difference(&traced.recording.preexisting_outputs).cloned().collect();
             Ok(Execution {
                 exit_code: traced.exit.code(),
                 inputs: traced.recording.inputs,
+                created,
                 result,
                 reasons,
                 traced: true,
@@ -334,11 +340,14 @@ fn first_mismatch<'e>(entry: &'e Entry, hasher: &mut ContentHasher) -> Option<(&
 
 /// Leaves what a hit would have left, so the commands that follow see the same
 /// files with and without --shadow.
-fn leave_cached_result(verdict: ShadowVerdict, cached: &Entry, store: &Store) -> Result<()> {
-    if verdict == ShadowVerdict::Nondeterministic {
-        outputs::restore(&cached.result.outputs, store)?;
+fn leave_cached_result(verdict: ShadowVerdict, cached: &Entry, fresh: &Execution, store: &Store) -> Result<()> {
+    if verdict != ShadowVerdict::Nondeterministic {
+        return Ok(());
     }
-    Ok(())
+    outputs::restore(&cached.result.outputs, store)?;
+    let cached_paths: HashSet<&Path> = cached.result.outputs.iter().map(|output| output.path.as_path()).collect();
+    let created_only_by_fresh_run = fresh.created.iter().filter(|path| !cached_paths.contains(path.as_path()));
+    outputs::remove_created(created_only_by_fresh_run.rev())
 }
 
 fn shadow_verdict(cached: &Entry, execution: &Execution) -> (ShadowVerdict, Vec<String>) {
