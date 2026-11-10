@@ -531,6 +531,17 @@ fn checking_a_file_it_may_not_read_still_sees_its_size() {
 }
 
 #[test]
+fn a_modification_time_the_command_chose_is_restored() {
+    let ws = Workspace::new();
+    let script = "touch -d @1000000000 stamp";
+    assert_outcome(&ws.sh(script), "miss");
+    fs::remove_file(ws.path("stamp")).unwrap();
+    assert_outcome(&ws.sh(script), "hit");
+    let modified = fs::metadata(ws.path("stamp")).unwrap().modified().unwrap();
+    assert_eq!(modified, std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000));
+}
+
+#[test]
 fn deletions_are_replayed() {
     let ws = Workspace::new();
     ws.write("stale.txt", "old");

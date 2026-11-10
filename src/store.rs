@@ -32,6 +32,10 @@ pub struct Output {
     /// can keep the order of modification times, which make and cargo compare.
     #[serde(default)]
     pub age_ns: u64,
+    /// The modification time the command chose, in nanoseconds since the epoch,
+    /// which restoring sets as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chosen_mtime_ns: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -370,6 +374,7 @@ mod tests {
             path: "/out".into(),
             state: OutputState::File { mode: 0o644, size: payload.len() as u64, content },
             age_ns: 0,
+            chosen_mtime_ns: None,
         };
         let result = RunResult { exit_code: 0, stdio: store.put_bytes(b"").unwrap(), outputs: vec![output] };
         let inputs =

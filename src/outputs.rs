@@ -29,6 +29,12 @@ pub fn capture(recording: &Recording, store: &Store) -> Result<Vec<Output>> {
             .ok()
             .and_then(|meta| end_of_run.duration_since(meta.modified().ok()?).ok())
             .map_or(0, |age| age.as_nanos() as u64);
+        let chosen_mtime_ns = match &meta {
+            Ok(meta) if recording.dated_outputs.contains(&path) => {
+                Some(meta.mtime() * 1_000_000_000 + meta.mtime_nsec())
+            }
+            _ => None,
+        };
         let state = match meta {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 if !recording.preexisting_outputs.contains(&path) {
@@ -57,7 +63,7 @@ pub fn capture(recording: &Recording, store: &Store) -> Result<Vec<Output>> {
             Ok(meta) if meta.file_type().is_socket() => continue,
             Ok(_) => bail!("creates a FIFO or device: {}", path.display()),
         };
-        outputs.push(Output { path, state, age_ns });
+        outputs.push(Output { path, state, age_ns, chosen_mtime_ns });
     }
     Ok(outputs)
 }
@@ -104,10 +110,18 @@ pub fn restore(outputs: &[Output], store: &Store) -> Result<()> {
     ages.dedup();
     for output in restored {
         let newer_ages = ages.partition_point(|&age| age > output.age_ns);
-        let modified = restored_at - MODIFICATION_STEP * (ages.len() - newer_ages) as u32;
+        let modified = match output.chosen_mtime_ns {
+            Some(nanoseconds) => since_epoch(nanoseconds),
+            None => restored_at - MODIFICATION_STEP * (ages.len() - newer_ages) as u32,
+        };
         set_modified(&output.path, modified).with_context(|| format!("dating {}", output.path.display()))?;
     }
     Ok(())
+}
+
+fn since_epoch(nanoseconds: i64) -> SystemTime {
+    let offset = Duration::from_nanos(nanoseconds.unsigned_abs());
+    if nanoseconds >= 0 { UNIX_EPOCH + offset } else { UNIX_EPOCH - offset }
 }
 
 /// Sets the modification time without following a symlink.

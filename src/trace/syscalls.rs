@@ -16,7 +16,7 @@ pub enum Call {
     Symlink { new_dirfd: i32, new: u64 },
     Chmod { dirfd: i32, path: u64 },
     ChmodFd { fd: i32 },
-    SetTimes { dirfd: i32, path: u64, flags: u64 },
+    SetTimes { dirfd: i32, path: u64, flags: u64, times: u64, timespecs: bool },
     Truncate { path: u64, length: u64 },
     Connect { fd: i32, addr: u64, len: u64 },
     SendTo { addr: u64, len: u64 },
@@ -56,7 +56,7 @@ pub fn decode(nr: u64, args: [u64; 6]) -> Option<Call> {
         libc::SYS_symlinkat => Call::Symlink { new_dirfd: fd(1), new: a2 },
         libc::SYS_fchmodat | FCHMODAT2 => Call::Chmod { dirfd: fd(0), path: a1 },
         libc::SYS_fchmod => Call::ChmodFd { fd: fd(0) },
-        libc::SYS_utimensat => Call::SetTimes { dirfd: fd(0), path: a1, flags: a3 },
+        libc::SYS_utimensat => Call::SetTimes { dirfd: fd(0), path: a1, flags: a3, times: a2, timespecs: true },
         libc::SYS_truncate => Call::Truncate { path: a0, length: a1 },
         libc::SYS_connect => Call::Connect { fd: fd(0), addr: a1, len: a2 },
         libc::SYS_sendto => Call::SendTo { addr: a4, len: args[5] },
@@ -107,8 +107,12 @@ fn decode_legacy(nr: c_long, args: [u64; 6]) -> Option<Call> {
         libc::SYS_link => Call::Link { old_dirfd: AT_FDCWD, old: a0, new_dirfd: AT_FDCWD, new: a1, flags: 0 },
         libc::SYS_symlink => Call::Symlink { new_dirfd: AT_FDCWD, new: a1 },
         libc::SYS_chmod => Call::Chmod { dirfd: AT_FDCWD, path: a0 },
-        libc::SYS_utime | libc::SYS_utimes => Call::SetTimes { dirfd: AT_FDCWD, path: a0, flags: 0 },
-        libc::SYS_futimesat => Call::SetTimes { dirfd: a0 as i32, path: a1, flags: 0 },
+        libc::SYS_utime | libc::SYS_utimes => {
+            Call::SetTimes { dirfd: AT_FDCWD, path: a0, flags: 0, times: a1, timespecs: false }
+        }
+        libc::SYS_futimesat => {
+            Call::SetTimes { dirfd: a0 as i32, path: a1, flags: 0, times: args[2], timespecs: false }
+        }
         _ => return None,
     };
     Some(call)

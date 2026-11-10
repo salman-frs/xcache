@@ -115,7 +115,7 @@ recorded as an input:
 | open for writing without `O_TRUNC`, `O_RDONLY\|O_CREAT`, `truncate` to a non-zero length | `read`, hashed immediately |
 | `rmdir` | `list` |
 | rename source | `read` for a file, `lstat` for a symlink; a directory the command didn't create makes the run uncacheable |
-| `chmod`, `fchmod` | `read` |
+| `chmod`, `fchmod`, setting a chosen time with `utimensat` | `read` |
 | `truncate` to zero | `stat` |
 
 Opening, truncating or chmodding a symlink changes the file it points to. In
@@ -158,6 +158,11 @@ file content and permission bits, directories, symlinks, and deletions
 (`outputs.rs`). Directories that were renamed into place are walked. Paths
 that didn't exist before the run and don't exist after it are skipped, which
 drops compiler temporaries with random names.
+
+Restored files get modification times in the order the run left them, a
+microsecond apart just before the restore, so build tools see them as newer
+than the checkout they are restored into. A file whose time the command set to
+a chosen value last, as `touch -d` and `cp -p` do, gets that time back.
 
 Restoring removes deleted paths first, deepest first, then creates
 directories, files and symlinks in path order. Files are written under a

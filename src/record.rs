@@ -13,6 +13,8 @@ pub struct Recording {
     pub outputs: BTreeSet<PathBuf>,
     pub preexisting_outputs: BTreeSet<PathBuf>,
     pub output_trees: BTreeSet<PathBuf>,
+    /// Outputs whose modification time the command set to a chosen value last.
+    pub dated_outputs: BTreeSet<PathBuf>,
     pub taints: Vec<String>,
 }
 
@@ -28,12 +30,13 @@ pub enum Effect {
     MakeNode,
     MakeLink,
     Chmod,
+    SetTimes,
     TruncateToZero,
 }
 
 impl Effect {
     fn follows_symlinks(self) -> bool {
-        matches!(self, Effect::Create | Effect::Modify | Effect::Chmod | Effect::TruncateToZero)
+        matches!(self, Effect::Create | Effect::Modify | Effect::Chmod | Effect::SetTimes | Effect::TruncateToZero)
     }
 }
 
@@ -92,6 +95,7 @@ pub struct Recorder<'h> {
     outputs: BTreeSet<PathBuf>,
     preexisting_outputs: BTreeSet<PathBuf>,
     output_trees: BTreeSet<PathBuf>,
+    dated_outputs: BTreeSet<PathBuf>,
     created: HashMap<PathBuf, HashSet<OsString>>,
     removed: HashMap<PathBuf, HashMap<OsString, EntryKind>>,
     taints: Vec<String>,
@@ -112,6 +116,7 @@ impl<'h> Recorder<'h> {
             outputs: BTreeSet::new(),
             preexisting_outputs: BTreeSet::new(),
             output_trees: BTreeSet::new(),
+            dated_outputs: BTreeSet::new(),
             created: HashMap::new(),
             removed: HashMap::new(),
             taints: Vec::new(),
@@ -150,7 +155,8 @@ impl<'h> Recorder<'h> {
                     self.taint(format!("renames a directory it did not create: {}", path.display()));
                     None
                 }
-                (Effect::RenameFrom, Some(EntryKind::File)) | (Effect::Modify | Effect::Chmod, _) => Some(Access::Read),
+                (Effect::RenameFrom, Some(EntryKind::File))
+                | (Effect::Modify | Effect::Chmod | Effect::SetTimes, _) => Some(Access::Read),
                 (Effect::Create | Effect::RenameTo, _) => Some(Access::Writable),
                 (Effect::RemoveDir, _) => Some(Access::List),
                 (Effect::TruncateToZero, _) => Some(Access::Stat),
@@ -191,6 +197,11 @@ impl<'h> Recorder<'h> {
     /// Called after the kernel reported that the mutation succeeded.
     pub fn mutated(&mut self, mutation: Mutation) {
         let Mutation { path, effect, parent, name, before } = mutation;
+        if effect == Effect::SetTimes {
+            self.dated_outputs.insert(path.clone());
+        } else {
+            self.dated_outputs.remove(&path);
+        }
         if self.outputs.insert(path.clone()) && before.is_some() {
             self.preexisting_outputs.insert(path.clone());
         }
@@ -203,7 +214,7 @@ impl<'h> Recorder<'h> {
         let meta = if effect == Effect::MakeLink { fs::symlink_metadata(&path) } else { fs::metadata(&path) };
         let is_dir = meta.as_ref().is_ok_and(fs::Metadata::is_dir);
         // A chmod leaves a directory's entries as they were, so they remain inputs.
-        if !(effect == Effect::Chmod && is_dir) {
+        if !(matches!(effect, Effect::Chmod | Effect::SetTimes) && is_dir) {
             if let Ok(meta) = &meta {
                 self.owned_inodes.insert((meta.dev(), meta.ino()));
             }
@@ -220,8 +231,12 @@ impl<'h> Recorder<'h> {
     pub fn renamed(&mut self, from: Mutation, to: Mutation) {
         let moved_directory = from.before == Some(EntryKind::Dir);
         let destination = to.path.clone();
+        let dated = self.dated_outputs.contains(&from.path);
         self.mutated(from);
         self.mutated(to);
+        if dated {
+            self.dated_outputs.insert(destination.clone());
+        }
         if moved_directory {
             self.owned_trees.push(destination.clone());
             self.output_trees.insert(destination);
@@ -252,6 +267,7 @@ impl<'h> Recorder<'h> {
             outputs: self.outputs,
             preexisting_outputs: self.preexisting_outputs,
             output_trees: self.output_trees,
+            dated_outputs: self.dated_outputs,
             taints: self.taints,
         }
     }

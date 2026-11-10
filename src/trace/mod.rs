@@ -653,11 +653,15 @@ impl<'h> Tracer<'h> {
             Call::Symlink { new_dirfd, new } => self.mutate(&[(path(new_dirfd, new)?, Effect::MakeLink)]),
             Call::Chmod { dirfd, path: address } => self.mutate(&[(path(dirfd, address)?, Effect::Chmod)]),
             Call::ChmodFd { fd } => self.mutate(&[(tracee::fd_path(pid, fd)?, Effect::Chmod)]),
-            Call::SetTimes { dirfd, path: address, flags } => {
+            Call::SetTimes { dirfd, path: address, flags, times, timespecs } => {
                 let target = if address == 0 { tracee::fd_path(pid, dirfd)? } else { path(dirfd, address)? };
                 let follows_symlinks = flags & libc::AT_SYMLINK_NOFOLLOW as u64 == 0;
-                self.recorder.before_times_change(&target, follows_symlinks);
-                Resume::Continue
+                if follows_symlinks && sets_a_modification_time(pid, times, timespecs) {
+                    self.mutate(&[(target, Effect::SetTimes)])
+                } else {
+                    self.recorder.before_times_change(&target, follows_symlinks);
+                    Resume::Continue
+                }
             }
             Call::Truncate { path: address, length } => {
                 let effect = if length == 0 { Effect::TruncateToZero } else { Effect::Modify };
@@ -809,6 +813,22 @@ impl<'h> Tracer<'h> {
             self.recorder.taint("creates Linux namespaces");
         }
     }
+}
+
+/// Whether a utime call sets a chosen modification time, as `touch -d` and
+/// `cp -p` do, rather than the current time or none.
+fn sets_a_modification_time(pid: Pid, times: u64, timespecs: bool) -> bool {
+    const TIMESPEC_SIZE: u64 = 16;
+    if times == 0 {
+        return false;
+    }
+    if !timespecs {
+        return true;
+    }
+    tracee::read_exact(pid, times + TIMESPEC_SIZE, TIMESPEC_SIZE as usize).is_some_and(|modified| {
+        let nanoseconds = i64::from_ne_bytes(modified[8..16].try_into().unwrap());
+        nanoseconds != libc::UTIME_NOW && nanoseconds != libc::UTIME_OMIT
+    })
 }
 
 fn is_running(pid: Pid) -> bool {
