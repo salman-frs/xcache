@@ -374,8 +374,10 @@ fn metadata(access: Access, path: &Path) -> std::io::Result<fs::Metadata> {
 /// resolved, so lexical prefixes cannot alias another directory. Magic links
 /// under /proc are followed through to their target.
 fn real_location(path: &Path) -> PathBuf {
-    if path.starts_with("/proc") {
-        return fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if path.starts_with("/proc")
+        && let Ok(real) = fs::canonicalize(path)
+    {
+        return real;
     }
     match (path.parent(), path.file_name()) {
         (Some(parent), Some(name)) => {
@@ -528,6 +530,19 @@ mod tests {
         let mut recorder = scenario.recorder();
         recorder.before_mutation(&dir, Effect::RenameFrom);
         assert_eq!(recorder.finish().taints.len(), 1);
+    }
+
+    #[test]
+    fn files_created_through_proc_are_owned() {
+        let mut scenario = Scenario::new();
+        let file = scenario.path("created");
+        let dir = fs::File::open(scenario.root()).unwrap();
+        let through_proc =
+            PathBuf::from(format!("/proc/{}/fd/{}/created", std::process::id(), std::os::fd::AsRawFd::as_raw_fd(&dir)));
+        let mut recorder = scenario.recorder();
+        create(&mut recorder, &through_proc, b"x");
+        recorder.observe(Access::Read, &file);
+        assert!(input(&recorder.finish(), Access::Read, &file).is_none());
     }
 
     #[test]

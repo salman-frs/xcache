@@ -14,7 +14,7 @@ use crate::invocation::Invocation;
 use crate::observe::{self, Access, State};
 use crate::outputs;
 use crate::record::Recorder;
-use crate::store::{Entry, Input, RunResult, Store, unix_now};
+use crate::store::{Entry, Input, OutputState, RunResult, Store, unix_now};
 use crate::trace::{self, Exit, Outcome};
 
 pub struct RunOptions {
@@ -358,7 +358,7 @@ fn shadow_verdict(cached: &Entry, execution: &Execution) -> (ShadowVerdict, Vec<
     if differences.is_empty() {
         return (ShadowVerdict::Correct, differences);
     }
-    let unrecorded = unrecorded_inputs(&cached.inputs, &execution.inputs);
+    let unrecorded = unrecorded_inputs(cached, &execution.inputs);
     if unrecorded.is_empty() {
         (ShadowVerdict::Nondeterministic, differences)
     } else {
@@ -368,14 +368,26 @@ fn shadow_verdict(cached: &Entry, execution: &Execution) -> (ShadowVerdict, Vec<
 
 /// Inputs the fresh run depended on that the cached run did not record.
 /// Probes of paths that did not exist are left out: tools pick random names for
-/// temporary files, so each run probes different absent paths.
-fn unrecorded_inputs(cached: &[Input], fresh: &[Input]) -> Vec<String> {
+/// temporary files, so each run probes different absent paths. So are files
+/// the fresh run found as the cached run left them: a build that rewrote a file
+/// before reading it did not depend on what was there, and a hit restores it.
+fn unrecorded_inputs(cached: &Entry, fresh: &[Input]) -> Vec<String> {
     let recorded: HashMap<(Access, &Path), &State> =
-        cached.iter().map(|input| ((input.access, input.path.as_path()), &input.state)).collect();
+        cached.inputs.iter().map(|input| ((input.access, input.path.as_path()), &input.state)).collect();
+    let written: HashMap<&Path, &OutputState> =
+        cached.result.outputs.iter().map(|output| (output.path.as_path(), &output.state)).collect();
+    let as_written = |input: &Input| match (&input.state, written.get(input.path.as_path())) {
+        (State::File { mode, content, .. }, Some(OutputState::File { mode: written_mode, content: written, .. })) => {
+            mode == written_mode && content == written
+        }
+        (State::Dir { .. }, Some(OutputState::Dir { .. })) => true,
+        _ => false,
+    };
     fresh
         .iter()
         .filter(|input| !matches!(input.state, State::Missing | State::Writable { is_dir: false, .. }))
         .filter(|input| recorded.get(&(input.access, input.path.as_path())) != Some(&&input.state))
+        .filter(|input| !as_written(input))
         .map(|input| {
             format!("{} ({:?}) was not recorded as {}", input.path.display(), input.access, describe(&input.state))
         })
