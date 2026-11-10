@@ -446,6 +446,45 @@ fn a_same_size_edit_behind_a_modification_time_check_misses() {
 }
 
 #[test]
+fn fresh_clones_of_the_same_commit_hit_although_their_git_index_differs() {
+    let ws = Workspace::new();
+    let git = |dir: &str, args: &[&str]| {
+        let status = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main"])
+            .args(args)
+            .current_dir(ws.path(dir))
+            .output()
+            .unwrap()
+            .status;
+        assert!(status.success(), "git {args:?}");
+    };
+    ws.write("origin/a.txt", "a");
+    git("origin", &["init", "-q"]);
+    git("origin", &["add", "a.txt"]);
+    git("origin", &["commit", "-q", "-m", "a"]);
+    let fresh_clone = || {
+        let _ = fs::remove_dir_all(ws.path("src"));
+        git(".", &["clone", "-q", "--no-local", "origin", "src"]);
+    };
+    let list_staged = || {
+        ws.run_with(&["git", "ls-files", "--stage"], |c| {
+            c.current_dir(ws.path("src"));
+        })
+    };
+
+    fresh_clone();
+    assert_outcome(&list_staged(), "miss");
+    fresh_clone();
+    assert_outcome(&list_staged(), "hit");
+
+    ws.write("src/a.txt", "b");
+    git("src", &["add", "a.txt"]);
+    let staged_change = list_staged();
+    assert_outcome(&staged_change, "miss");
+    assert!(staged_change.stdout.contains("63d8dbd40c23542e740659a7168a0ce3138ea748"), "{}", staged_change.stdout);
+}
+
+#[test]
 fn shadow_mode_leaves_what_a_hit_would_so_later_commands_see_the_same_files() {
     let ws = Workspace::new();
     let stamp = ["sh", "-c", "date +%s%N > stamp.txt"];

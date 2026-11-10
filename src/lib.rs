@@ -3,6 +3,7 @@ compile_error!("xcache traces Linux system calls and only builds for Linux");
 
 pub mod cli;
 mod digest;
+mod git_index;
 mod invocation;
 mod observe;
 mod outputs;

@@ -8,11 +8,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::git_index;
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Digest([u8; 32]);
 
 impl Digest {
-    #[cfg(test)]
     pub fn of_bytes(bytes: &[u8]) -> Self {
         Self(*blake3::hash(bytes).as_bytes())
     }
@@ -80,7 +81,7 @@ struct Known {
     digest: Digest,
 }
 
-const CACHE_MAGIC: &[u8] = b"xcache-stat-v1\n";
+const CACHE_MAGIC: &[u8] = b"xcache-stat-v2\n";
 const RECORD_LEN: usize = 8 * 7 + 32;
 const MAX_KNOWN: usize = 500_000;
 // Matches git's "racy" guard: a file touched within the timestamp granularity
@@ -123,7 +124,13 @@ impl ContentHasher {
             return Ok(known.digest);
         }
 
-        let digest = Digest::of_reader(&file)?;
+        let digest = if git_index::is_index(path) {
+            let mut bytes = Vec::new();
+            (&file).read_to_end(&mut bytes)?;
+            git_index::digest(&bytes).unwrap_or_else(|| Digest::of_bytes(&bytes))
+        } else {
+            Digest::of_reader(&file)?
+        };
         let unchanged_while_hashing = Stamp::of(&file.metadata()?) == stamp;
         if unchanged_while_hashing && stamp.is_settled() {
             self.known.insert(key, Known { stamp, digest });
