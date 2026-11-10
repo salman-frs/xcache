@@ -243,6 +243,8 @@ name = "libuv"
 repo = "libuv/libuv"
 rev = "ac325226bd37e9ca978694dd01b7cf600f05a339"
 ecosystem = "cmake"
+# Both test binaries use port 9123, so running them in parallel fails without xcache.
+env = { CTEST_PARALLEL_LEVEL = "1" }
 steps = [
   "cmake -S . -B build -DLIBUV_BUILD_TESTS=ON",
   "cmake --build build",
