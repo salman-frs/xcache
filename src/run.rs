@@ -310,11 +310,26 @@ fn run_untraced(invocation: &Invocation) -> Result<i32> {
     Ok(status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)))
 }
 
+/// Checks what costs no hashing first, then hashes the remaining files in parallel.
 fn first_mismatch<'e>(entry: &'e Entry, hasher: &mut ContentHasher) -> Option<(&'e Input, State)> {
-    entry.inputs.iter().find_map(|input| {
+    let mismatch = |input: &'e Input, hasher: &mut ContentHasher| {
         let current = observe::probe(input.access, &input.path, hasher);
         (current != input.state).then_some((input, current))
-    })
+    };
+    let (files, others): (Vec<&Input>, Vec<&Input>) =
+        entry.inputs.iter().partition(|input| matches!(input.state, State::File { .. }));
+    if let Some(found) = others.into_iter().find_map(|input| mismatch(input, hasher)) {
+        return Some(found);
+    }
+    let metadata_changed = files
+        .iter()
+        .filter(|input| !observe::file_metadata_matches(input.access, &input.path, &input.state))
+        .find_map(|input| mismatch(input, hasher));
+    if metadata_changed.is_some() {
+        return metadata_changed;
+    }
+    hasher.prefetch(&files.iter().map(|input| input.path.as_path()).collect::<Vec<_>>());
+    files.into_iter().find_map(|input| mismatch(input, hasher))
 }
 
 /// Leaves what a hit would have left, so the commands that follow see the same

@@ -222,6 +222,12 @@ impl<'h> Recorder<'h> {
 
     pub fn finish(mut self) -> Recording {
         let observations = std::mem::take(&mut self.observations);
+        let deferred: Vec<&Path> = observations
+            .iter()
+            .filter(|observation| matches!(observation.recorded, Recorded::Deferred(_)))
+            .map(|observation| observation.path.as_path())
+            .collect();
+        self.hasher.prefetch(&deferred);
         let mut inputs = Vec::with_capacity(observations.len());
         for Observation { access, path, recorded } in observations {
             let state = match recorded {

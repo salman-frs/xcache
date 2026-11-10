@@ -105,6 +105,16 @@ pub fn probe(access: Access, path: &Path, hasher: &mut ContentHasher) -> State {
     }
 }
 
+/// Whether a file recorded as `state` still has the same type, size and
+/// permissions, which is cheaper to check than its content.
+pub fn file_metadata_matches(access: Access, path: &Path, state: &State) -> bool {
+    let State::File { size, mode, .. } = state else {
+        return false;
+    };
+    let meta = if access == Access::Lstat { fs::symlink_metadata(path) } else { fs::metadata(path) };
+    meta.is_ok_and(|meta| meta.is_file() && meta.len() == *size && permission_bits(&meta) == *mode)
+}
+
 pub fn read_listing(dir: &Path) -> io::Result<Listing> {
     fs::read_dir(dir)?
         .map(|entry| {

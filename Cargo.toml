@@ -11,7 +11,7 @@ categories = ["command-line-utilities", "development-tools::build-utils"]
 
 [dependencies]
 anyhow = "1"
-blake3 = "1"
+blake3 = { version = "1", features = ["rayon"] }
 clap = { version = "4", features = ["derive", "env"] }
 libc = "0.2"
 nix = { version = "0.31", features = ["ptrace", "signal", "process"] }
