@@ -22,6 +22,7 @@ use crate::invocation::Invocation;
 use crate::observe::Access;
 use crate::record::{Effect, Mutation, Recorder, Recording};
 use filter::Filter;
+use net::Destination;
 use syscalls::Call;
 
 const NAMESPACE_FLAGS: u64 = (libc::CLONE_NEWNS
@@ -356,6 +357,7 @@ enum Pending {
     Rename { from: Mutation, to: Mutation },
     UntracedChild,
     Accept,
+    Connect(Destination),
 }
 
 enum Resume {
@@ -542,6 +544,7 @@ impl<'h> Tracer<'h> {
                     self.recorder.taint(reason);
                 }
             }
+            Pending::Connect(destination) => self.connected(pid, &destination, result),
             Pending::Mutations(_) | Pending::Rename { .. } | Pending::UntracedChild | Pending::Accept => {}
         }
     }
@@ -629,7 +632,11 @@ impl<'h> Tracer<'h> {
                 let effect = if length == 0 { Effect::TruncateToZero } else { Effect::Modify };
                 self.mutate(&[(path(libc::AT_FDCWD, address)?, effect)])
             }
-            Call::Connect { addr, len } | Call::SendTo { addr, len } => {
+            Call::Connect { addr, len } => match net::read_sockaddr(pid, addr, len) {
+                Some(destination) => Resume::UntilExit(Pending::Connect(destination)),
+                None => Resume::Continue,
+            },
+            Call::SendTo { addr, len } => {
                 self.check_peer(pid, addr, len);
                 Resume::Continue
             }
@@ -700,12 +707,30 @@ impl<'h> Tracer<'h> {
         if mutations.is_empty() { Resume::Continue } else { Resume::UntilExit(Pending::Mutations(mutations)) }
     }
 
+    /// A connection that failed reached no one. For a socket path, such as
+    /// nscd's when nscd is not running, it showed whether the path exists.
+    fn connected(&mut self, pid: Pid, destination: &Destination, result: i64) {
+        let found_nothing = matches!(-result as i32, libc::ENOENT | libc::ENOTDIR | libc::ECONNREFUSED);
+        match destination {
+            Destination::UnixPath(path) if found_nothing => {
+                if let Some(path) = tracee::resolve(pid, libc::AT_FDCWD, path) {
+                    self.recorder.observe(Access::Lstat, &path);
+                }
+            }
+            Destination::Loopback { port: 0 } => {}
+            _ => self.check_destination(pid, destination),
+        }
+    }
+
     fn check_peer(&mut self, pid: Pid, address: u64, length: u64) {
-        let Some(destination) = net::read_sockaddr(pid, address, length) else {
-            return;
-        };
+        if let Some(destination) = net::read_sockaddr(pid, address, length) {
+            self.check_destination(pid, &destination);
+        }
+    }
+
+    fn check_destination(&mut self, pid: Pid, destination: &Destination) {
         let tracees: Vec<Pid> = self.tracees.keys().copied().collect();
-        if let Some(reason) = net::external_peer(pid, &destination, &tracees) {
+        if let Some(reason) = net::external_peer(pid, destination, &tracees) {
             self.recorder.taint(reason);
         }
     }

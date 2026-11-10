@@ -47,10 +47,12 @@ pub fn parse_sockaddr(bytes: &[u8]) -> Destination {
     }
 }
 
+/// Connecting to the unspecified address reaches this host, like loopback.
 fn ip_destination(ip: IpAddr, port: u16) -> Destination {
+    let local = |v4: Ipv4Addr| v4.is_loopback() || v4.is_unspecified();
     let loopback = match ip {
-        IpAddr::V4(v4) => v4.is_loopback(),
-        IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+        IpAddr::V4(v4) => local(v4),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified() || v6.to_ipv4_mapped().is_some_and(local),
     };
     if loopback { Destination::Loopback { port } } else { Destination::Remote(format!("{ip}:{port}")) }
 }
@@ -227,6 +229,7 @@ mod tests {
     fn classifies_destinations() {
         assert_eq!(parse_sockaddr(&inet([127, 0, 0, 1], 8080)), Destination::Loopback { port: 8080 });
         assert_eq!(parse_sockaddr(&inet([1, 1, 1, 1], 53)), Destination::Remote("1.1.1.1:53".into()));
+        assert_eq!(parse_sockaddr(&inet([0, 0, 0, 0], 9123)), Destination::Loopback { port: 9123 });
 
         let mut unix = (libc::AF_UNIX as u16).to_ne_bytes().to_vec();
         unix.extend(b"/run/docker.sock\0");

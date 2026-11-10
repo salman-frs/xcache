@@ -265,6 +265,19 @@ fn network_access_is_not_cached() {
 }
 
 #[test]
+fn a_socket_path_with_no_service_behind_it_is_an_input() {
+    let ws = Workspace::new();
+    let script = "import socket\ns = socket.socket(socket.AF_UNIX)\ntry: s.connect('service.sock')\nexcept OSError: print('no service')";
+    assert_outcome(&ws.run(&["python3", "-c", script]), "miss");
+    assert_outcome(&ws.run(&["python3", "-c", script]), "hit");
+
+    let _service = std::os::unix::net::UnixListener::bind(ws.path("service.sock")).unwrap();
+    let run = ws.run(&["python3", "-c", script]);
+    assert_outcome(&run, "not_cached");
+    assert!(run.reasons().contains("service.sock"), "{}", run.reasons());
+}
+
+#[test]
 fn talking_to_its_own_local_server_is_cacheable() {
     let ws = Workspace::new();
     let script = "import socket\nserver = socket.create_server(('127.0.0.1', 0))\nclient = socket.create_connection(server.getsockname())\nprint('connected')";
