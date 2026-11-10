@@ -193,7 +193,7 @@ class Workspace:
             GRADLE_USER_HOME=f"{home}/.gradle",
             npm_config_cache=f"{home}/.npm",
         )
-        for name in ("GOCACHE", "GOMODCACHE", "UV_CACHE_DIR", "PIP_CACHE_DIR"):
+        for name in ("GOCACHE", "GOMODCACHE", "UV_CACHE_DIR", "PIP_CACHE_DIR", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"):
             env.pop(name, None)
         env.update(self.project.env)
         return env
