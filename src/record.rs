@@ -261,6 +261,15 @@ impl<'h> Recorder<'h> {
             return;
         }
         self.seen.entry(access).or_default().insert(requested.to_path_buf());
+        if access == Access::Listen {
+            let state = observe::probe(access, requested, self.hasher);
+            self.observations.push(Observation {
+                access,
+                path: requested.to_path_buf(),
+                recorded: Recorded::Known(state),
+            });
+            return;
+        }
         let real = real_location(requested);
         if self.is_excluded(&real) || self.is_owned(&real) || leads_to_machine_state(access, &real) {
             return;

@@ -51,6 +51,7 @@ the corresponding system calls can tell the command (`observe.rs`):
 | `lstat` | `lstat`, `readlink`, `AT_SYMLINK_NOFOLLOW`, `O_NOFOLLOW` | as `stat`, or the target of a symlink |
 | `list` | `getdents64` | names and types of the entries |
 | `writable` | create with truncation | whether the parent is a directory, whether the path is one |
+| `listen` | a connection to a loopback port that reached nothing | whether anything is bound to the port |
 
 A `stat` can't see a file's content, but it does see its modification time,
 and make, ninja, git and Python's bytecode cache decide what to do by comparing
@@ -225,6 +226,11 @@ capturing the outputs shows what actually happened.
 - a loopback port or Unix socket is allowed only if the socket on the other
   end belongs to a traced process, which is checked with `/proc/<pid>/net/*`
   and the processes' file descriptors;
+- a connection that reaches nothing is an input instead: a socket path with
+  no file is a missing path, and a refused loopback port, or a datagram socket
+  connected to a port nothing is bound to, is a `listen` input. glibc's
+  getaddrinfo connects datagram sockets, without sending, to sort the
+  addresses it returns, and checks for `nscd`'s socket on every lookup;
 - netlink sockets, which only talk to the kernel, are allowed.
 
 An accepted TCP connection gets the same check from the other side.

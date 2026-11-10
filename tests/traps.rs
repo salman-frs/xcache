@@ -295,6 +295,24 @@ fn many_datagrams_to_its_own_sockets_stay_fast() {
 }
 
 #[test]
+fn an_unused_loopback_port_is_an_input() {
+    let ws = Workspace::new();
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let script = format!(
+        "import socket\nu = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\nu.connect(('127.0.0.1', {udp}))\n\
+         t = socket.socket()\ntry: t.connect(('127.0.0.1', {tcp}))\nexcept OSError: pass"
+    );
+    assert_outcome(&ws.run(&["python3", "-c", &script]), "miss");
+    assert_outcome(&ws.run(&["python3", "-c", &script]), "hit");
+
+    let _service = std::net::UdpSocket::bind(("127.0.0.1", udp)).unwrap();
+    let run = ws.run(&["python3", "-c", &script]);
+    assert_outcome(&run, "not_cached");
+    assert!(run.reasons().contains(&format!("port {udp}")), "{}", run.reasons());
+}
+
+#[test]
 fn talking_to_its_own_local_server_is_cacheable() {
     let ws = Workspace::new();
     let script = "import socket\nserver = socket.create_server(('127.0.0.1', 0))\nclient = socket.create_connection(server.getsockname())\nprint('connected')";

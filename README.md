@@ -130,9 +130,10 @@ A command still runs normally, but its result is not stored, when it:
 
 xcache prints the reason when this happens.
 
-A connection that finds nothing at a socket path, such as glibc checking for
-`nscd`, only shows that the path is empty. That is recorded as an input, so the
-command misses if a service appears there later.
+A connection that finds nothing, such as glibc checking for `nscd`'s socket or
+probing `localhost` to sort the addresses it resolved, only shows that nothing
+is there. That is recorded as an input, so the command misses if a service
+appears there later.
 
 ## Known caveats
 

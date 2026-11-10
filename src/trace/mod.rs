@@ -1,5 +1,5 @@
 mod filter;
-mod net;
+pub(crate) mod net;
 mod syscalls;
 mod tracee;
 
@@ -725,8 +725,10 @@ impl<'h> Tracer<'h> {
         if mutations.is_empty() { Resume::Continue } else { Resume::UntilExit(Pending::Mutations(mutations)) }
     }
 
-    /// A connection that failed reached no one. For a socket path, such as
-    /// nscd's when nscd is not running, it showed whether the path exists.
+    /// A connection that reached no one only showed that nothing was there: no
+    /// file at a socket path (nscd's, when nscd is not running), or nothing
+    /// bound to a loopback port. glibc connects datagram sockets, without
+    /// sending, to sort the addresses getaddrinfo returns.
     fn connected(&mut self, pid: Pid, fd: i32, destination: &Destination, result: i64) {
         let found_nothing = matches!(-result as i32, libc::ENOENT | libc::ENOTDIR | libc::ECONNREFUSED);
         if let Destination::Loopback { .. } = destination
@@ -742,6 +744,12 @@ impl<'h> Tracer<'h> {
                 }
             }
             Destination::Loopback { port: 0 } => {}
+            Destination::Loopback { port } if -result == libc::ECONNREFUSED as i64 => {
+                self.recorder.observe(Access::Listen, &net::port_key(false, *port));
+            }
+            Destination::Loopback { port } if net::datagram_to_nobody(pid, fd, *port) => {
+                self.recorder.observe(Access::Listen, &net::port_key(true, *port));
+            }
             _ => self.check_destination(pid, destination),
         }
     }

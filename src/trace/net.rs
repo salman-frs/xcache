@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 
 use nix::unistd::Pid;
 
@@ -160,7 +161,42 @@ struct InetSocket {
     local: SocketAddr,
     remote: SocketAddr,
     listening: bool,
+    connectionless: bool,
     inode: u64,
+}
+
+/// The path of a `listen` input for a loopback port.
+pub fn port_key(datagram: bool, port: u16) -> PathBuf {
+    PathBuf::from(format!("{}:{port}", if datagram { "udp" } else { "tcp" }))
+}
+
+/// Whether anything is bound to the port a `listen` input names, or None if
+/// the key is not one.
+pub fn is_bound(key: &Path) -> Option<bool> {
+    let (protocol, port) = key.to_str()?.split_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    let datagram = match protocol {
+        "udp" => true,
+        "tcp" => false,
+        _ => return None,
+    };
+    let sockets = inet_sockets(nix::unistd::getpid());
+    Some(
+        sockets
+            .iter()
+            .any(|socket| socket.connectionless == datagram && socket.local.port() == port && socket.listening),
+    )
+}
+
+/// Whether `fd` is a datagram socket and no other socket is bound to `port`.
+pub fn datagram_to_nobody(pid: Pid, fd: i32, port: u16) -> bool {
+    let Some(inode) = fd_socket_inode(pid, fd) else {
+        return false;
+    };
+    let sockets = inet_sockets(pid);
+    let is_datagram = sockets.iter().any(|socket| socket.inode == inode && socket.connectionless);
+    is_datagram
+        && !sockets.iter().any(|socket| socket.inode != inode && socket.local.port() == port && socket.listening)
 }
 
 fn loopback_listeners(pid: Pid, port: u16) -> Vec<u64> {
@@ -189,7 +225,13 @@ fn inet_sockets(pid: Pid) -> Vec<InetSocket> {
             else {
                 continue;
             };
-            sockets.push(InetSocket { local, remote, listening: connectionless || *state == TCP_LISTEN, inode });
+            sockets.push(InetSocket {
+                local,
+                remote,
+                listening: connectionless || *state == TCP_LISTEN,
+                connectionless,
+                inode,
+            });
         }
     }
     sockets

@@ -18,6 +18,8 @@ pub enum Access {
     Lstat,
     List,
     Writable,
+    /// Whether anything is bound to a loopback port, named `tcp:PORT` or `udp:PORT`.
+    Listen,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +126,11 @@ pub fn probe(access: Access, path: &Path, hasher: &mut ContentHasher) -> State {
         Access::Writable => {
             State::Writable { parent_is_dir: path.parent().is_some_and(Path::is_dir), is_dir: path.is_dir() }
         }
+        Access::Listen => match crate::trace::net::is_bound(path) {
+            Some(true) => State::Special { kind: SpecialKind::Socket },
+            Some(false) => State::Missing,
+            None => State::Error { errno: libc::EINVAL },
+        },
     }
 }
 
