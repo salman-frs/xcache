@@ -625,6 +625,28 @@ fn reading_a_file_the_cached_run_wrote_is_not_a_false_hit() {
 }
 
 #[test]
+fn reading_what_the_cached_run_only_checked_is_not_a_false_hit() {
+    let ws = Workspace::new();
+    ws.write("data.txt", "same");
+    ws.write("marker", "");
+    let set_age = |name: &str, seconds_ago: u64| {
+        let file = fs::File::options().write(true).open(ws.path(name)).unwrap();
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(seconds_ago)).unwrap();
+    };
+    set_age("data.txt", 200);
+    set_age("marker", 100);
+    let build = "if [ data.txt -nt marker ]; then read line < data.txt; test -e data.txt/sub; \
+                 else test -s data.txt; fi; date +%s%N > built";
+    assert_outcome(&ws.sh(build), "miss");
+
+    set_age("data.txt", 50);
+    let shadowed = ws.run_with(&["sh", "-c", build], |c| {
+        c.arg("--shadow");
+    });
+    assert_eq!(shadowed.report["shadow"], "nondeterministic", "{}", shadowed.report);
+}
+
+#[test]
 fn a_fresh_failure_with_the_same_inputs_is_nondeterministic_not_a_false_hit() {
     let ws = Workspace::new();
     let counter = ws.store.path().join("runs");
