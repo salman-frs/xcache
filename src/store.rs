@@ -189,6 +189,13 @@ impl Store {
         self.write_entries(fingerprint, &entries)
     }
 
+    pub fn remove(&self, fingerprint: Digest, entry: &Entry) -> io::Result<()> {
+        let _lock = self.lock()?;
+        let mut entries = self.entries(fingerprint)?;
+        entries.retain(|existing| !same_inputs(existing, entry));
+        self.write_entries(fingerprint, &entries)
+    }
+
     pub fn mark_used(&self, fingerprint: Digest, created_at: u64) -> io::Result<()> {
         let _lock = self.lock()?;
         let mut entries = self.entries(fingerprint)?;

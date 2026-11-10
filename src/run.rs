@@ -102,7 +102,7 @@ pub fn run(options: RunOptions) -> Result<i32> {
         say(format!("ignoring unreadable cache entries ({error})"));
         Vec::new()
     });
-    let hit = entries.iter().find(|entry| first_mismatch(entry, &mut hasher).is_none());
+    let mut hit = entries.iter().find(|entry| first_mismatch(entry, &mut hasher).is_none());
     report.timings_ms.lookup = started.elapsed().as_millis() as u64;
 
     if let Some(entry) = hit
@@ -125,7 +125,10 @@ pub fn run(options: RunOptions) -> Result<i32> {
                 write_report(&options.report, &report)?;
                 return Ok(entry.result.exit_code);
             }
-            Err(error) => say(format!("could not restore the cached result ({error:#}); running the command")),
+            Err(error) => {
+                say(format!("could not restore the cached result ({error:#}); running the command"));
+                hit = None;
+            }
         }
     }
 
@@ -143,9 +146,7 @@ pub fn run(options: RunOptions) -> Result<i32> {
         (None, true) => ReportOutcome::NotCached,
     };
 
-    if options.shadow
-        && let Some(cached) = hit
-    {
+    if let Some(cached) = hit {
         let (verdict, differences) = shadow_verdict(cached, &execution);
         report.shadow = Some(verdict);
         report.differences = differences;
@@ -156,7 +157,23 @@ pub fn run(options: RunOptions) -> Result<i32> {
                 "shadow: the command read the same inputs but produced a different result, so it is nondeterministic: {details}"
             )),
             ShadowVerdict::FalseHit => {
-                eprintln!("xcache: shadow: FALSE HIT, the cached result differs from a fresh run: {details}")
+                eprintln!("xcache: shadow: FALSE HIT, the cached result differs from a fresh run: {details}");
+                if let Err(error) = store.remove(fingerprint, cached) {
+                    say(format!("could not remove the wrong cache entry ({error})"));
+                }
+            }
+        }
+        if verdict != ShadowVerdict::FalseHit {
+            match leave_cached_result(verdict, cached, &store) {
+                Ok(()) => {
+                    let _ = store.mark_used(fingerprint, cached.created_at);
+                    let _ = hasher.save();
+                    report.exit_code = cached.result.exit_code;
+                    report.duration_ms = duration.as_millis() as u64;
+                    write_report(&options.report, &report)?;
+                    return Ok(cached.result.exit_code);
+                }
+                Err(error) => say(format!("could not restore the cached result ({error:#}); keeping the fresh one")),
             }
         }
     }
@@ -300,12 +317,20 @@ fn first_mismatch<'e>(entry: &'e Entry, hasher: &mut ContentHasher) -> Option<(&
     })
 }
 
+/// Leaves what a hit would have left, so the commands that follow see the same
+/// files with and without --shadow.
+fn leave_cached_result(verdict: ShadowVerdict, cached: &Entry, store: &Store) -> Result<()> {
+    if verdict == ShadowVerdict::Nondeterministic {
+        outputs::restore(&cached.result.outputs, store)?;
+    }
+    Ok(())
+}
+
 fn shadow_verdict(cached: &Entry, execution: &Execution) -> (ShadowVerdict, Vec<String>) {
-    let Some(fresh) = &execution.result else {
-        let reasons = execution.reasons.iter().map(|reason| format!("fresh run is not cacheable: {reason}")).collect();
-        return (ShadowVerdict::FalseHit, reasons);
+    let differences = match &execution.result {
+        Some(fresh) => differences(&cached.result, fresh),
+        None => execution.reasons.iter().map(|reason| format!("fresh run is not cacheable: {reason}")).collect(),
     };
-    let differences = differences(&cached.result, fresh);
     if differences.is_empty() {
         return (ShadowVerdict::Correct, differences);
     }

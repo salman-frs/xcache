@@ -53,11 +53,16 @@ the cache with a new project. It reports one of:
 
 - `correct`: same files, same output, same exit status.
 - `nondeterministic`: the fresh run read exactly the same inputs but produced
-  different output. A date written to a log file, or the output of a parallel
-  `make` interleaving differently, looks like this.
+  different output, or failed. A date written to a log file, the output of a
+  parallel `make` interleaving differently, or a flaky test looks like this.
 - `false_hit`: the fresh run depended on something the cached run didn't
   record. That is a bug in xcache. Please open an issue with the `--report`
   output.
+
+Unless it finds a false hit, shadow mode then leaves the cached files and exit
+status in place, as a hit would, so the commands after it see the same files
+with and without `--shadow`. After a false hit it keeps the fresh result and
+removes the wrong entry from the cache.
 
 ### Environment variables
 

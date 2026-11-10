@@ -214,7 +214,7 @@ An accepted TCP connection gets the same check from the other side.
 ## Shadow mode
 
 `--shadow` runs the command on a hit, records it, and compares the two
-results (`run.rs`). If they differ:
+results (`run.rs`). If they differ, or the fresh run is not cacheable:
 
 - `nondeterministic` means the fresh run read the same inputs, with the same
   states, as the cached run;
@@ -222,6 +222,13 @@ results (`run.rs`). If they differ:
 
 Paths that didn't exist are ignored in this comparison. Programs pick random
 names for temporary files, so every run checks different missing paths.
+
+When the result is `correct` or `nondeterministic`, xcache restores the cached
+outputs and exits with the cached status, as a hit would. Otherwise every
+nondeterministic command would change the inputs of the commands after it, and
+those commands would miss under `--shadow` where they hit without it, so their
+hits would never be checked. A false hit keeps the fresh result, and the entry
+that produced it is removed so that later runs can't reuse it.
 
 ## Store
 

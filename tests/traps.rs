@@ -426,6 +426,42 @@ fn shadow_mode_confirms_hits_and_catches_nondeterminism() {
 }
 
 #[test]
+fn shadow_mode_leaves_what_a_hit_would_so_later_commands_see_the_same_files() {
+    let ws = Workspace::new();
+    let stamp = ["sh", "-c", "date +%s%N > stamp.txt"];
+    let copy = ["sh", "-c", "cat stamp.txt > copy.txt"];
+    assert_outcome(&ws.run(&stamp), "miss");
+    assert_outcome(&ws.run(&copy), "miss");
+    let cached_stamp = ws.read("stamp.txt");
+
+    let shadowed = ws.run_with(&stamp, |c| {
+        c.arg("--shadow");
+    });
+    assert_eq!(shadowed.report["shadow"], "nondeterministic", "{}", shadowed.report);
+    assert_eq!(ws.read("stamp.txt"), cached_stamp);
+
+    let downstream = ws.run_with(&copy, |c| {
+        c.arg("--shadow");
+    });
+    assert_eq!(downstream.report["shadow"], "correct", "{}", downstream.report);
+}
+
+#[test]
+fn a_fresh_failure_with_the_same_inputs_is_nondeterministic_not_a_false_hit() {
+    let ws = Workspace::new();
+    let counter = ws.store.path().join("runs");
+    fs::write(&counter, "0").unwrap();
+    let flaky = format!("n=$(cat {0}); echo $((n + 1)) > {0}; test $n -eq 0", counter.display());
+    assert_outcome(&ws.sh(&flaky), "miss");
+
+    let shadowed = ws.run_with(&["sh", "-c", &flaky], |c| {
+        c.arg("--shadow");
+    });
+    assert_eq!(shadowed.report["shadow"], "nondeterministic", "{}", shadowed.report);
+    assert_eq!(shadowed.status, 0);
+}
+
+#[test]
 fn unknown_commands_exit_127() {
     let ws = Workspace::new();
     let run = ws.run(&["definitely-not-a-command"]);
