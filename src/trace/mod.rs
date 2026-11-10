@@ -668,6 +668,12 @@ impl<'h> Tracer<'h> {
             Call::Clone { flags } => self.clone(flags),
             Call::Clone3 { args } => self.clone(u64::from_ne_bytes(tracee::read_exact(pid, args, 8)?.try_into().ok()?)),
             Call::Accept => Resume::UntilExit(Pending::Accept),
+            Call::Bind { addr, len } => match net::read_sockaddr(pid, addr, len) {
+                Some(Destination::UnixPath(path)) => {
+                    self.mutate(&[(tracee::resolve(pid, libc::AT_FDCWD, &path)?, Effect::MakeNode)])
+                }
+                _ => Resume::Continue,
+            },
             Call::Unsupported(reason) => {
                 self.recorder.taint(reason);
                 Resume::Continue
@@ -745,6 +751,11 @@ impl<'h> Tracer<'h> {
     }
 
     fn check_destination(&mut self, pid: Pid, destination: &Destination) {
+        if let Destination::UnixPath(path) = destination
+            && tracee::resolve(pid, libc::AT_FDCWD, path).is_some_and(|path| self.recorder.created_by_command(&path))
+        {
+            return;
+        }
         let tracees: Vec<Pid> = self.tracees.keys().copied().collect();
         if let Some(reason) = net::external_peer(pid, destination, &tracees) {
             self.recorder.taint(reason);

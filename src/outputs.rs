@@ -3,7 +3,7 @@ use std::ffi::CString;
 use std::fs::{self, File};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -54,7 +54,8 @@ pub fn capture(recording: &Recording, store: &Store) -> Result<Vec<Output>> {
                     store.put_file(&path).with_context(|| format!("storing output {}", path.display()))?;
                 OutputState::File { mode: observe::permission_bits(&meta), size, content }
             }
-            Ok(_) => bail!("creates a FIFO, socket or device: {}", path.display()),
+            Ok(meta) if meta.file_type().is_socket() => continue,
+            Ok(_) => bail!("creates a FIFO or device: {}", path.display()),
         };
         outputs.push(Output { path, state, age_ns });
     }

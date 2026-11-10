@@ -26,6 +26,7 @@ pub enum Call {
     Clone3 { args: u64 },
     Unshare { flags: u64 },
     Accept,
+    Bind { addr: u64, len: u64 },
     Unsupported(&'static str),
 }
 
@@ -66,6 +67,7 @@ pub fn decode(nr: u64, args: [u64; 6]) -> Option<Call> {
         libc::SYS_unshare => Call::Unshare { flags: a0 },
         libc::SYS_setns => Call::Unsupported("joins another Linux namespace"),
         libc::SYS_accept | libc::SYS_accept4 => Call::Accept,
+        libc::SYS_bind => Call::Bind { addr: a1, len: a2 },
         libc::SYS_mount
         | libc::SYS_umount2
         | libc::SYS_pivot_root
@@ -147,6 +149,7 @@ pub fn traced() -> Vec<c_long> {
         libc::SYS_setns,
         libc::SYS_accept,
         libc::SYS_accept4,
+        libc::SYS_bind,
         libc::SYS_mount,
         libc::SYS_umount2,
         libc::SYS_open_tree,

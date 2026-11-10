@@ -262,7 +262,7 @@ impl<'h> Recorder<'h> {
         }
         self.seen.entry(access).or_default().insert(requested.to_path_buf());
         let real = real_location(requested);
-        if self.is_excluded(&real) || self.is_owned(&real) {
+        if self.is_excluded(&real) || self.is_owned(&real) || leads_to_machine_state(access, &real) {
             return;
         }
         // Paths under /proc name the tracee (cwd, fd links); record where they lead.
@@ -339,10 +339,12 @@ impl<'h> Recorder<'h> {
     }
 
     fn is_excluded(&self, real: &Path) -> bool {
-        let machine_state = real.starts_with("/proc")
-            || real.starts_with("/sys")
-            || (real.starts_with("/dev") && !real.starts_with("/dev/shm"));
-        machine_state || self.excluded.iter().any(|excluded| real.starts_with(excluded))
+        is_machine_state(real) || self.excluded.iter().any(|excluded| real.starts_with(excluded))
+    }
+
+    /// Whether the command created the file at `path`, such as a socket it bound.
+    pub fn created_by_command(&self, path: &Path) -> bool {
+        self.is_owned(&real_location(path))
     }
 
     fn is_owned(&self, real: &Path) -> bool {
@@ -350,6 +352,18 @@ impl<'h> Recorder<'h> {
             || self.owned_trees.iter().any(|tree| real.starts_with(tree))
             || fs::metadata(real).is_ok_and(|meta| self.owned_inodes.contains(&(meta.dev(), meta.ino())))
     }
+}
+
+/// A symlink such as /etc/mtab can lead into /proc, which is machine state.
+fn leads_to_machine_state(access: Access, real: &Path) -> bool {
+    let follows_symlinks = matches!(access, Access::Read | Access::Stat);
+    follows_symlinks
+        && fs::symlink_metadata(real).is_ok_and(|meta| meta.is_symlink())
+        && fs::canonicalize(real).is_ok_and(|target| is_machine_state(&target))
+}
+
+fn is_machine_state(real: &Path) -> bool {
+    real.starts_with("/proc") || real.starts_with("/sys") || (real.starts_with("/dev") && !real.starts_with("/dev/shm"))
 }
 
 fn metadata(access: Access, path: &Path) -> std::io::Result<fs::Metadata> {
@@ -522,5 +536,18 @@ mod tests {
         let mut recorder = scenario.recorder();
         recorder.observe(Access::Read, Path::new("/proc/self/status"));
         assert!(recorder.finish().inputs.is_empty());
+    }
+
+    #[test]
+    fn symlinks_into_proc_are_not_inputs() {
+        let mut scenario = Scenario::new();
+        let mtab = scenario.path("mtab");
+        std::os::unix::fs::symlink("/proc/self/mounts", &mtab).unwrap();
+        let mut recorder = scenario.recorder();
+        recorder.observe(Access::Read, &mtab);
+        recorder.observe(Access::Lstat, &mtab);
+        let recording = recorder.finish();
+        assert_eq!(recording.inputs.len(), 1);
+        assert_eq!(recording.inputs[0].state, State::Symlink { target: "/proc/self/mounts".into() });
     }
 }

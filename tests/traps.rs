@@ -278,6 +278,14 @@ fn a_socket_path_with_no_service_behind_it_is_an_input() {
 }
 
 #[test]
+fn a_socket_it_binds_renames_and_connects_to_is_its_own() {
+    let ws = Workspace::new();
+    let script = "import os, socket\nserver = socket.socket(socket.AF_UNIX)\nserver.bind('agent.tmp')\nos.chmod('agent.tmp', 0o600)\nos.rename('agent.tmp', 'agent')\nserver.listen()\nclient = socket.socket(socket.AF_UNIX)\nclient.connect('agent')\nos.unlink('agent')";
+    assert_outcome(&ws.run(&["python3", "-c", script]), "miss");
+    assert_outcome(&ws.run(&["python3", "-c", script]), "hit");
+}
+
+#[test]
 fn talking_to_its_own_local_server_is_cacheable() {
     let ws = Workspace::new();
     let script = "import socket\nserver = socket.create_server(('127.0.0.1', 0))\nclient = socket.create_connection(server.getsockname())\nprint('connected')";
