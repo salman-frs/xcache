@@ -19,12 +19,13 @@ env = { CARGO_INCREMENTAL = "0", CARGO_TERM_COLOR = "never" }
 
 [ecosystem.node]
 setup = ["npm ci"]
-env = { npm_config_audit = "false", npm_config_fund = "false", npm_config_logs_max = "0", npm_config_update_notifier = "false" }
+env = { NODE_DISABLE_COMPILE_CACHE = "1", npm_config_audit = "false", npm_config_fund = "false", npm_config_logs_max = "0", npm_config_update_notifier = "false" }
 
 [ecosystem.python]
 setup = ["uv sync --locked"]
 env = { UV_NO_PROGRESS = "1" }
 
+# Gradle and Kotlin daemons outlive the command, so every step runs without them.
 [ecosystem.gradle]
 env = {}
 
@@ -202,24 +203,24 @@ name = "spring-petclinic"
 repo = "spring-projects/spring-petclinic"
 rev = "500158f732419217507c7656904b8e6aa1bcc0d6"
 ecosystem = "gradle"
-prime = ["./gradlew assemble check", "./gradlew --stop"]
-steps = ["./gradlew assemble", "./gradlew check"]
+prime = ["./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process assemble check"]
+steps = ["./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process assemble", "./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process check"]
 
 [[project]]
 name = "kotlinpoet"
 repo = "square/kotlinpoet"
 rev = "66105b28628a471d3ade229f9c30e676392384b6"
 ecosystem = "gradle"
-prime = ["./gradlew assemble :kotlinpoet:testJdk21", "./gradlew --stop"]
-steps = ["./gradlew assemble", "./gradlew :kotlinpoet:testJdk21"]
+prime = ["./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process assemble :kotlinpoet:testJdk21"]
+steps = ["./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process assemble", "./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process :kotlinpoet:testJdk21"]
 
 [[project]]
 name = "mockito"
 repo = "mockito/mockito"
 rev = "10b31ba2a8252cf340bc154c9e05224802a84691"
 ecosystem = "gradle"
-prime = ["./gradlew assemble :mockito-core:test", "./gradlew --stop"]
-steps = ["./gradlew assemble", "./gradlew :mockito-core:test"]
+prime = ["./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process assemble :mockito-core:test"]
+steps = ["./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process assemble", "./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process :mockito-core:test"]
 
 # C and C++ with CMake
 

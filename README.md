@@ -95,6 +95,16 @@ Until there is a remote cache, keep the cache directory between runs with
 `npm ci` is not wrapped because it downloads packages, and commands that use
 the network are never cached.
 
+Some tools keep caches of their own that change on every run, so a step that
+reads them never hits. Turn them off in jobs that use xcache:
+
+- Node's module compile cache, which npm enables:
+  `NODE_DISABLE_COMPILE_CACHE=1`.
+- npm's debug logs, which npm rotates by listing their directory:
+  `npm_config_logs_max=0`.
+- Go's usage counters, which the go command updates on every run, where the
+  home directory persists between runs: `go telemetry off`.
+
 ### Cache location and size
 
 The cache is stored in `$XCACHE_DIR`, or `$XDG_CACHE_HOME/xcache`, or
@@ -112,7 +122,7 @@ A command still runs normally, but its result is not stored, when it:
 
 - exits with a non-zero status;
 - connects to the network, or to a local service it didn't start itself
-  (Docker, a database, `nscd`), or accepts a connection from one;
+  (Docker, a database, a DNS resolver), or accepts a connection from one;
 - leaves processes running after it exits (xcache kills them);
 - creates namespaces, mounts filesystems, or calls `chroot`;
 - renames a directory it didn't create;
@@ -120,20 +130,31 @@ A command still runs normally, but its result is not stored, when it:
 
 xcache prints the reason when this happens.
 
+A connection that finds nothing at a socket path, such as glibc checking for
+`nscd`, only shows that the path is empty. That is recorded as an input, so the
+command misses if a service appears there later.
+
 ## Known caveats
 
 - The clock and random numbers can't be traced. If a command writes a
   timestamp into a file, a cache hit restores the old timestamp.
 - Reads under `/proc`, `/sys` and `/dev` (except `/dev/shm`) are not tracked.
   CPU counts and cgroup limits count as properties of the machine.
-- Restored files get the recorded content and permissions, but the current
-  time and the current user as owner.
+- Restored files get the recorded content and permissions, and modification
+  times in the order the original run left them, ending at the time of the
+  restore. Their owner is the current user.
+- A `stat` of a file records its content, which stands in for its modification
+  time: make, ninja and git compare times, and times change on every checkout.
+  Touching a file without changing it doesn't cause a miss.
+- Git's index and reflogs are compared without the stat data, times and
+  identities they keep about the checkout.
 - A miss is slower than running the command directly, because every traced
   system call stops in xcache. See [Performance](#performance).
 - Many tools check whether their outputs exist, so in a working tree that
   already has build output the first run misses once.
 - Build daemons (Gradle, Bazel, sccache) outlive the command that starts them,
-  so those runs are not cached.
+  so those runs are not cached. Run Gradle without them:
+  `./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process build`.
 - If ptrace or seccomp filters are not allowed, as in some sandboxes, xcache
   says so and runs the command without caching.
 
@@ -196,7 +217,7 @@ writing a cache key. Roughly in order:
 
 ## Development
 
-The tests need `sh`, `gcc`, `go` and `python3`:
+The tests need `sh`, `gcc`, `go`, `python3` and `git`:
 
 ```sh
 cargo test
