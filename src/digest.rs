@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::git_index;
+use crate::git;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Digest([u8; 32]);
@@ -224,10 +224,10 @@ fn digest_of(path: &Path, known: &HashMap<FileKey, Known>) -> io::Result<(Digest
         return Ok((known.digest, None));
     }
 
-    let digest = if git_index::is_index(path) {
+    let digest = if git::is_bookkeeping(path) {
         let mut bytes = Vec::new();
         (&file).read_to_end(&mut bytes)?;
-        git_index::digest(&bytes).unwrap_or_else(|| Digest::of_bytes(&bytes))
+        git::digest(path, &bytes).unwrap_or_else(|| Digest::of_bytes(&bytes))
     } else {
         Digest::of_file(&file, before.len())?
     };

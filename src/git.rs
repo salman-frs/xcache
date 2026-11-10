@@ -1,11 +1,12 @@
-//! Git's index stores the stat data (times, inode, size) of every tracked file
-//! next to its object ID, so two checkouts of the same commit have different
-//! index files. The digest here covers what the index says about the tree and
-//! leaves out that stat cache. A command that relies on the stat cache compares
-//! it with the work tree, whose files xcache records by content.
+//! Git keeps bookkeeping about each checkout next to the repository: the index
+//! stores the stat data (times, inode, size) of every tracked file, and the
+//! reflogs record who moved HEAD and when. Two checkouts of the same commit
+//! differ there, and cargo and `go build` read both. The digests here leave
+//! that bookkeeping out. A command that relies on the index's stat data
+//! compares it with the work tree, whose files xcache records by content.
 
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use crate::digest::Digest;
 
@@ -19,14 +20,63 @@ const EXTENDED_FLAG: u16 = 0x4000;
 const NAME_LENGTH_MASK: u16 = 0x0fff;
 const STAT_EXTENSIONS: [&[u8]; 4] = [b"UNTR", b"FSMN", b"EOIE", b"IEOT"];
 
-pub fn is_index(path: &Path) -> bool {
-    path.file_name() == Some(OsStr::new("index"))
-        && path.ancestors().skip(1).any(|dir| dir.file_name() == Some(OsStr::new(".git")))
+enum Bookkeeping {
+    Index,
+    Reflog,
 }
 
-/// Returns None for anything that does not parse as a SHA-1 index of version
-/// 2 to 4, so the caller can fall back to hashing the raw bytes.
-pub fn digest(bytes: &[u8]) -> Option<Digest> {
+fn bookkeeping(path: &Path) -> Option<Bookkeeping> {
+    let is = |component: &Component, name: &str| *component == Component::Normal(OsStr::new(name));
+    let mut components = path.components().skip_while(|component| !is(component, ".git"));
+    components.next()?;
+    let inside_git_dir: Vec<Component> = components.collect();
+    match inside_git_dir.as_slice() {
+        [.., last] if is(last, "index") => Some(Bookkeeping::Index),
+        components if components.iter().any(|component| is(component, "logs")) => Some(Bookkeeping::Reflog),
+        _ => None,
+    }
+}
+
+pub fn is_bookkeeping(path: &Path) -> bool {
+    bookkeeping(path).is_some()
+}
+
+/// None for a file that is not an index or reflog, or does not parse as one;
+/// the caller then hashes it as it is.
+pub fn digest(path: &Path, bytes: &[u8]) -> Option<Digest> {
+    match bookkeeping(path)? {
+        Bookkeeping::Index => index_digest(bytes),
+        Bookkeeping::Reflog => reflog_digest(bytes),
+    }
+}
+
+/// Keeps each entry's old and new object IDs and message, and leaves out the
+/// identity, which names the machine when no user is configured, and the time.
+fn reflog_digest(bytes: &[u8]) -> Option<Digest> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"xcache-git-reflog-v1");
+    for line in bytes.split_inclusive(|&byte| byte == b'\n') {
+        let tab = line.iter().position(|&byte| byte == b'\t')?;
+        let (header, message) = line.split_at(tab);
+        let mut fields = header.splitn(3, |&byte| byte == b' ');
+        let (old, new) = (fields.next()?, fields.next()?);
+        if !is_object_id(old) || !is_object_id(new) {
+            return None;
+        }
+        for field in [old, new, message] {
+            hasher.update(&(field.len() as u64).to_le_bytes());
+            hasher.update(field);
+        }
+    }
+    Some(Digest::of_hasher(&hasher))
+}
+
+fn is_object_id(field: &[u8]) -> bool {
+    matches!(field.len(), 40 | 64) && field.iter().all(u8::is_ascii_hexdigit)
+}
+
+/// Returns None for anything that is not a SHA-1 index of version 2 to 4.
+fn index_digest(bytes: &[u8]) -> Option<Digest> {
     let mut reader = Reader { bytes, offset: 0 };
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"xcache-git-index-v1");
@@ -152,6 +202,10 @@ mod tests {
         dir
     }
 
+    fn index_digest_of(dir: &Path) -> Option<Digest> {
+        digest(&dir.join(".git/index"), &index_of(dir))
+    }
+
     #[test]
     fn checkouts_of_the_same_tree_have_the_same_digest() {
         for version in ["2", "3", "4"] {
@@ -161,8 +215,8 @@ mod tests {
             let two = repository_with(version, &files);
             let (one, two) = (index_of(one.path()), index_of(two.path()));
             assert_ne!(one, two, "the raw indexes should differ in their stat data");
-            assert!(digest(&one).is_some(), "version {version} should parse");
-            assert_eq!(digest(&one), digest(&two), "version {version}");
+            assert!(index_digest(&one).is_some(), "version {version} should parse");
+            assert_eq!(index_digest(&one), index_digest(&two), "version {version}");
         }
     }
 
@@ -170,21 +224,38 @@ mod tests {
     fn staged_content_changes_the_digest() {
         let one = repository_with("2", &[("a.txt", "one")]);
         let two = repository_with("2", &[("a.txt", "two")]);
-        assert_ne!(digest(&index_of(one.path())), digest(&index_of(two.path())));
+        assert_ne!(index_digest_of(one.path()), index_digest_of(two.path()));
     }
 
     #[test]
     fn anything_else_is_not_parsed() {
-        assert_eq!(digest(b"not an index"), None);
+        assert_eq!(index_digest(b"not an index"), None);
         let index = index_of(repository_with("2", &[("a.txt", "a")]).path());
-        assert_eq!(digest(&index[..index.len() - 1]), None);
+        assert_eq!(index_digest(&index[..index.len() - 1]), None);
+        assert_eq!(reflog_digest(b"not a reflog\n"), None);
     }
 
     #[test]
-    fn only_index_files_inside_git_directories_qualify() {
-        assert!(is_index(Path::new("/src/.git/index")));
-        assert!(is_index(Path::new("/src/.git/worktrees/feature/index")));
-        assert!(!is_index(Path::new("/src/index")));
-        assert!(!is_index(Path::new("/src/.git/indexes")));
+    fn reflogs_differ_only_in_who_moved_head_and_when() {
+        let oid = |c: char| c.to_string().repeat(40);
+        let entry = |who: &str, when: &str| {
+            format!("{} {} {who} {when}\tcheckout: moving from main to {}\n", oid('0'), oid('a'), oid('a'))
+        };
+        let here = entry("runner <runner@fv-az1.internal>", "1794328357 +0000");
+        let there = entry("runner <runner@fv-az2.internal>", "1794329999 +0700");
+        assert_eq!(reflog_digest(here.as_bytes()), reflog_digest(there.as_bytes()));
+        let elsewhere = here.replace("to aaaa", "to bbbb");
+        assert_ne!(reflog_digest(here.as_bytes()), reflog_digest(elsewhere.as_bytes()));
+    }
+
+    #[test]
+    fn only_bookkeeping_inside_git_directories_qualifies() {
+        let index = index_of(repository_with("2", &[("a.txt", "a")]).path());
+        assert!(digest(Path::new("/src/.git/index"), &index).is_some());
+        assert!(digest(Path::new("/src/.git/worktrees/feature/index"), &index).is_some());
+        assert!(digest(Path::new("/src/index"), &index).is_none());
+        assert!(digest(Path::new("/src/.git/logs/HEAD"), b"").is_some());
+        assert!(digest(Path::new("/src/.git/HEAD"), b"ref: refs/heads/main\n").is_none());
+        assert!(digest(Path::new("/src/logs/HEAD"), b"").is_none());
     }
 }

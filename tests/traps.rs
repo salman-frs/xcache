@@ -492,7 +492,7 @@ fn a_same_size_edit_behind_a_modification_time_check_misses() {
 }
 
 #[test]
-fn fresh_clones_of_the_same_commit_hit_although_their_git_index_differs() {
+fn fresh_clones_of_the_same_commit_hit_although_git_bookkeeping_differs() {
     let ws = Workspace::new();
     let git = |dir: &str, args: &[&str]| {
         let status = Command::new("git")
@@ -511,23 +511,27 @@ fn fresh_clones_of_the_same_commit_hit_although_their_git_index_differs() {
     let fresh_clone = || {
         let _ = fs::remove_dir_all(ws.path("src"));
         git(".", &["clone", "-q", "--no-local", "origin", "src"]);
+        git("src", &["checkout", "-q", "--detach"]);
     };
-    let list_staged = || {
-        ws.run_with(&["git", "ls-files", "--stage"], |c| {
+    let status = || {
+        ws.run_with(&["git", "status"], |c| {
             c.current_dir(ws.path("src"));
         })
     };
 
     fresh_clone();
-    assert_outcome(&list_staged(), "miss");
+    assert_outcome(&status(), "miss");
+    std::thread::sleep(Duration::from_secs(1));
     fresh_clone();
-    assert_outcome(&list_staged(), "hit");
+    let again = status();
+    assert_outcome(&again, "hit");
+    assert!(again.stdout.contains("HEAD detached"), "{}", again.stdout);
 
     ws.write("src/a.txt", "b");
     git("src", &["add", "a.txt"]);
-    let staged_change = list_staged();
+    let staged_change = status();
     assert_outcome(&staged_change, "miss");
-    assert!(staged_change.stdout.contains("63d8dbd40c23542e740659a7168a0ce3138ea748"), "{}", staged_change.stdout);
+    assert!(staged_change.stdout.contains("modified:   a.txt"), "{}", staged_change.stdout);
 }
 
 #[test]

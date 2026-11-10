@@ -60,13 +60,15 @@ size. Times change on every checkout, so they can't be part of the key. A file's
 content is recorded instead: when it is unchanged, so is anything the command
 could have derived from its time, as long as the command is deterministic.
 
-Git's index (`.git/index`) is the exception that needs a closer look. It keeps
-the inode, times and size of every tracked file, so two checkouts of the same
-commit have different index files, and cargo and `go build` read it on every
-build. Its digest covers the paths, modes, object IDs and flags of its entries,
-and the extensions other than the untracked and fsmonitor caches
-(`git_index.rs`). Git uses the stat data only to skip re-reading work tree
-files, and those files are inputs by content.
+Git's bookkeeping needs a closer look. The index (`.git/index`) keeps the
+inode, times and size of every tracked file, and the reflogs (`.git/logs/`)
+record who moved HEAD and when, with an identity that names the machine when no
+user is configured. Two checkouts of the same commit differ in both, and cargo
+and `go build` read them on every build. The index digest covers the paths,
+modes, object IDs and flags of its entries, and the extensions other than the
+untracked and fsmonitor caches; a reflog digest covers each entry's object IDs
+and message (`git.rs`). Git uses the index's stat data only to skip re-reading
+work tree files, and those files are inputs by content.
 
 A path that doesn't exist is recorded as missing. This matters for search
 paths: a compiler that finds `config.h` in its fifth include directory has
