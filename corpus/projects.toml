@@ -19,7 +19,7 @@ env = { CARGO_INCREMENTAL = "0", CARGO_TERM_COLOR = "never" }
 
 [ecosystem.node]
 setup = ["npm ci"]
-env = { npm_config_audit = "false", npm_config_fund = "false", npm_config_update_notifier = "false" }
+env = { npm_config_audit = "false", npm_config_fund = "false", npm_config_logs_max = "0", npm_config_update_notifier = "false" }
 
 [ecosystem.python]
 setup = ["uv sync --locked"]
@@ -112,6 +112,7 @@ name = "luxon"
 repo = "moment/luxon"
 rev = "f427515a38f6a671f8de663e6bcc040ed81f114e"
 ecosystem = "node"
+env = { LANG = "en_US.utf8", TZ = "America/New_York" }
 steps = ["npm run build", "npm test"]
 
 [[project]]
@@ -179,11 +180,12 @@ prime = ["uv build --wheel"]
 steps = ["uv build --wheel --offline", ".venv/bin/pytest"]
 
 [[project]]
-name = "rich"
-repo = "Textualize/rich"
-rev = "3a109ccdffe5b2d0e30684a304fbd388e99ce57b"
+name = "jinja"
+repo = "pallets/jinja"
+rev = "5ef70112a1ff19c05324ff889dd30405b1002044"
 ecosystem = "python"
-steps = [".venv/bin/black --check .", ".venv/bin/pytest"]
+setup = ["uv sync --locked --group tests"]
+steps = [".venv/bin/ruff check", ".venv/bin/pytest"]
 
 [[project]]
 name = "more-itertools"
@@ -208,8 +210,8 @@ name = "kotlinpoet"
 repo = "square/kotlinpoet"
 rev = "66105b28628a471d3ade229f9c30e676392384b6"
 ecosystem = "gradle"
-prime = ["./gradlew assemble :kotlinpoet:test", "./gradlew --stop"]
-steps = ["./gradlew assemble", "./gradlew :kotlinpoet:test"]
+prime = ["./gradlew assemble :kotlinpoet:testJdk21", "./gradlew --stop"]
+steps = ["./gradlew assemble", "./gradlew :kotlinpoet:testJdk21"]
 
 [[project]]
 name = "mockito"

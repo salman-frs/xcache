@@ -311,7 +311,7 @@ class ProjectSummary:
     ecosystem: str
     steps: int
     cacheable: int
-    not_cacheable_reasons: list[str]
+    not_cacheable: dict[str, list[str]]
     miss_overhead: float | None
     hit_speedup: float | None
     warm_hits: int
@@ -333,11 +333,11 @@ def summarize_project(result: dict) -> ProjectSummary:
     commit_runs = [run for run in runs if run["phase"].startswith("commit-")]
 
     cacheable_steps = {step for step, run in cold.items() if run["xcache"]["outcome"] == "miss"}
-    reasons = [
-        f"`{step}`: {'; '.join(run['xcache'].get('reasons', [])) or run['xcache']['outcome']}"
+    not_cacheable = {
+        step: distinct_reasons(run["xcache"].get("reasons", [])) or [run["xcache"]["outcome"]]
         for step, run in cold.items()
         if step not in cacheable_steps
-    ]
+    }
     both = [step for step in cold if step in baseline]
     miss_overhead = ratio(sum(cold[s]["wall_ms"] for s in both), sum(baseline[s]["wall_ms"] for s in both))
     warm_hit_steps = [step for step, run in warm.items() if run["xcache"]["outcome"] == "hit"]
@@ -362,7 +362,7 @@ def summarize_project(result: dict) -> ProjectSummary:
         ecosystem=result["ecosystem"],
         steps=len(cold),
         cacheable=len(cacheable_steps),
-        not_cacheable_reasons=reasons,
+        not_cacheable=not_cacheable,
         miss_overhead=None if miss_overhead is None else miss_overhead - 1,
         hit_speedup=hit_speedup,
         warm_hits=len(warm_hit_steps),
@@ -382,8 +382,19 @@ def ratio(numerator: float, denominator: float) -> float | None:
 
 def reason_category(reason: str) -> str:
     """Groups reasons that differ only in a path, port or address."""
+    reason = re.sub(r" \(.*\)$", "", reason)
     reason = re.sub(r"exited with status \d+", "exited with a non-zero status", reason)
-    return re.split(r" to |: | \(", reason, maxsplit=1)[0]
+    reason = re.sub(r"^network access to .*", "network access", reason)
+    reason = re.sub(r"^accepted a connection from [0-9a-f.:\[\]]+$", "accepted a connection from another machine", reason)
+    return reason.split(": ", 1)[0]
+
+
+def distinct_reasons(reasons: list[str]) -> list[str]:
+    """The first reason of each category, so fifty refused connections read as one."""
+    first_of_category: dict[str, str] = {}
+    for reason in reasons:
+        first_of_category.setdefault(reason_category(reason), reason)
+    return list(first_of_category.values())
 
 
 def decision(false_hits: int, cacheable_share: float) -> str:
@@ -430,9 +441,8 @@ def render_report(summaries: list[ProjectSummary]) -> str:
 
     reasons: dict[str, int] = {}
     for s in summaries:
-        for reason in s.not_cacheable_reasons:
-            for part in reason.split(": ", 1)[1].split("; "):
-                category = reason_category(part)
+        for step_reasons in s.not_cacheable.values():
+            for category in {reason_category(reason) for reason in step_reasons}:
                 reasons[category] = reasons.get(category, 0) + 1
     if reasons:
         lines += ["", "## Why steps were not cacheable", "", "| Reason | Steps |", "|---|---|"]
@@ -441,7 +451,7 @@ def render_report(summaries: list[ProjectSummary]) -> str:
     lines += ["", "## Details", ""]
     for s in sorted(summaries, key=lambda s: (s.ecosystem, s.name, s.arch)):
         notes = []
-        notes += [f"- not cacheable: {reason}" for reason in s.not_cacheable_reasons]
+        notes += [f"- not cacheable: `{step}`: {'; '.join(reasons)}" for step, reasons in s.not_cacheable.items()]
         notes += [f"- **false hit** in {f['phase']} at {f['commit'][:12]}, `{f['step']}`: "
                   f"{'; '.join(f['differences'][:5])}" for f in s.false_hits]
         notes += [f"- nondeterministic in {f['phase']}, `{f['step']}`: {'; '.join(f['differences'][:3])}"
