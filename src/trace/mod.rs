@@ -14,10 +14,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use nix::errno::Errno;
 use nix::sys::ptrace::{self, Event, Options};
 use nix::sys::signal::{self, Signal};
-use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 
 use crate::invocation::Invocation;
@@ -38,6 +36,7 @@ const CLONE_UNTRACED: u64 = libc::CLONE_UNTRACED as u64;
 const RESOLVE_IN_ROOT: u64 = 0x10;
 const STATUS_FD: RawFd = 3;
 const LEFTOVER_PROCESSES: &str = "left processes running after it exited (they were terminated)";
+const NO_SIGNAL: i32 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
@@ -387,8 +386,8 @@ impl<'h> Tracer<'h> {
 
     /// Returns false if the child exited before stopping, so tracing could not be set up.
     fn attach(&mut self) -> Result<bool> {
-        match waitpid(self.root, Some(WaitPidFlag::__WALL)).context("waiting for the command to start")? {
-            WaitStatus::Stopped(_, Signal::SIGSTOP) => {}
+        match wait_for(Some(self.root)).context("waiting for the command to start")? {
+            Stop::Signal(_, libc::SIGSTOP) => {}
             _ => return Ok(false),
         }
         let options = Options::PTRACE_O_TRACESYSGOOD
@@ -406,24 +405,21 @@ impl<'h> Tracer<'h> {
 
     fn run_until_all_exit(&mut self) -> Result<()> {
         loop {
-            let status = match waitpid(None, Some(WaitPidFlag::__WALL)) {
-                Ok(status) => status,
-                Err(Errno::EINTR) => continue,
-                Err(Errno::ECHILD) => return Ok(()),
+            let stop = match wait_for(None) {
+                Ok(stop) => stop,
+                Err(error) if error.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => return Ok(()),
                 Err(error) => return Err(error).context("waitpid"),
             };
-            if let Some(pid) = status.pid()
-                && self.outlives_root(pid, &status)
-            {
+            if self.outlives_root(&stop) {
                 continue;
             }
-            match status {
-                WaitStatus::Exited(pid, code) => self.exited(pid, Exit::Code(code)),
-                WaitStatus::Signaled(pid, signal, _) => self.exited(pid, Exit::Signal(signal as i32)),
-                WaitStatus::PtraceEvent(pid, _, event) => self.ptrace_event(pid, event),
-                WaitStatus::PtraceSyscall(pid) => self.syscall_exit(pid),
-                WaitStatus::Stopped(pid, signal) => self.signal_stop(pid, signal),
-                _ => {}
+            match stop {
+                Stop::Exited(pid, code) => self.exited(pid, Exit::Code(code)),
+                Stop::Killed(pid, signal) => self.exited(pid, Exit::Signal(signal)),
+                Stop::Event(pid, event) => self.ptrace_event(pid, event),
+                Stop::Syscall(pid) => self.syscall_exit(pid),
+                Stop::Signal(pid, signal) => self.signal_stop(pid, signal),
             }
         }
     }
@@ -452,27 +448,30 @@ impl<'h> Tracer<'h> {
 
     /// A process first seen after the command exited is a leftover too: its
     /// fork event was still queued when the leftovers were terminated.
-    fn outlives_root(&mut self, pid: Pid, status: &WaitStatus) -> bool {
-        let still_running = !matches!(status, WaitStatus::Exited(..) | WaitStatus::Signaled(..));
-        if self.root_exit.is_none() || !still_running {
+    fn outlives_root(&mut self, stop: &Stop) -> bool {
+        let still_running = match *stop {
+            Stop::Exited(..) | Stop::Killed(..) => None,
+            Stop::Event(pid, _) | Stop::Syscall(pid) | Stop::Signal(pid, _) => Some(pid),
+        };
+        let (Some(pid), Some(_)) = (still_running, self.root_exit) else {
             return false;
-        }
+        };
         self.recorder.taint(LEFTOVER_PROCESSES);
         let _ = signal::kill(pid, Signal::SIGKILL);
-        resume(pid, None);
+        resume(pid, NO_SIGNAL);
         true
     }
 
-    fn signal_stop(&mut self, pid: Pid, signal: Signal) {
+    fn signal_stop(&mut self, pid: Pid, signal: i32) {
         let tracee = self.tracees.entry(pid).or_default();
-        if signal == Signal::SIGSTOP && !tracee.attached {
+        if signal == libc::SIGSTOP && !tracee.attached {
             tracee.attached = true;
-            resume(pid, None);
+            resume(pid, NO_SIGNAL);
             return;
         }
-        let is_group_stop = matches!(signal, Signal::SIGSTOP | Signal::SIGTSTP | Signal::SIGTTIN | Signal::SIGTTOU)
+        let is_group_stop = matches!(signal, libc::SIGSTOP | libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU)
             && ptrace::getsiginfo(pid).is_err();
-        resume(pid, if is_group_stop { None } else { Some(signal) });
+        resume(pid, if is_group_stop { NO_SIGNAL } else { signal });
     }
 
     fn ptrace_event(&mut self, pid: Pid, event: i32) {
@@ -480,7 +479,7 @@ impl<'h> Tracer<'h> {
             e if e == Event::PTRACE_EVENT_SECCOMP as i32 => {
                 let resume_mode = self.syscall_entry(pid);
                 match resume_mode {
-                    Resume::Continue => resume(pid, None),
+                    Resume::Continue => resume(pid, NO_SIGNAL),
                     Resume::UntilExit(pending) => {
                         self.tracees.entry(pid).or_default().pending = Some(pending);
                         if ptrace::syscall(pid, None).is_err() {
@@ -496,7 +495,7 @@ impl<'h> Tracer<'h> {
                 if let Ok(child) = ptrace::getevent(pid) {
                     self.tracees.entry(Pid::from_raw(child as i32)).or_default();
                 }
-                resume(pid, None);
+                resume(pid, NO_SIGNAL);
             }
             e if e == Event::PTRACE_EVENT_EXEC as i32 => {
                 self.exec_seen = true;
@@ -512,9 +511,9 @@ impl<'h> Tracer<'h> {
                 for file in tracee::mapped_files(pid) {
                     self.recorder.observe(Access::Read, &file);
                 }
-                resume(pid, None);
+                resume(pid, NO_SIGNAL);
             }
-            _ => resume(pid, None),
+            _ => resume(pid, NO_SIGNAL),
         }
     }
 
@@ -523,7 +522,7 @@ impl<'h> Tracer<'h> {
         if let (Some(pending), Ok(result)) = (pending, tracee::syscall_result(pid)) {
             self.complete(pending, result, pid);
         }
-        resume(pid, None);
+        resume(pid, NO_SIGNAL);
     }
 
     fn complete(&mut self, pending: Pending, result: i64, pid: Pid) {
@@ -735,8 +734,42 @@ fn is_running(pid: Pid) -> bool {
     !matches!(state, Some('Z' | 'X') | None)
 }
 
-fn resume(pid: Pid, signal: Option<Signal>) {
-    let _ = ptrace::cont(pid, signal);
+/// What waitpid reported. Signals stay numbers, because nix has no names for
+/// the real-time signals that glibc and the JVM send between their threads.
+enum Stop {
+    Exited(Pid, i32),
+    Killed(Pid, i32),
+    Event(Pid, i32),
+    Syscall(Pid),
+    Signal(Pid, i32),
+}
+
+fn wait_for(pid: Option<Pid>) -> io::Result<Stop> {
+    let mut status = 0;
+    // SAFETY: waitpid writes the status of one child into `status`.
+    let waited = unsafe { libc::waitpid(pid.map_or(-1, Pid::as_raw), &mut status, libc::__WALL) };
+    if waited < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let pid = Pid::from_raw(waited);
+    Ok(if libc::WIFEXITED(status) {
+        Stop::Exited(pid, libc::WEXITSTATUS(status))
+    } else if libc::WIFSIGNALED(status) {
+        Stop::Killed(pid, libc::WTERMSIG(status))
+    } else if libc::WSTOPSIG(status) == libc::SIGTRAP | 0x80 {
+        Stop::Syscall(pid)
+    } else if status >> 16 != 0 {
+        Stop::Event(pid, status >> 16)
+    } else {
+        Stop::Signal(pid, libc::WSTOPSIG(status))
+    })
+}
+
+fn resume(pid: Pid, signal: i32) {
+    // SAFETY: PTRACE_CONT takes no address and the signal to deliver as data.
+    unsafe {
+        libc::ptrace(libc::PTRACE_CONT, pid.as_raw(), std::ptr::null_mut::<libc::c_void>(), signal as libc::c_long)
+    };
 }
 
 #[cfg(test)]

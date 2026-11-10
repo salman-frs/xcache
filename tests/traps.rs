@@ -299,6 +299,15 @@ fn processes_left_running_are_terminated_and_not_cached() {
 }
 
 #[test]
+fn real_time_signals_reach_the_command() {
+    let ws = Workspace::new();
+    let script = "import os, signal\nsignal.signal(signal.SIGRTMIN, lambda *_: print('handled'))\nos.kill(os.getpid(), signal.SIGRTMIN)";
+    let run = ws.run(&["python3", "-c", script]);
+    assert_eq!(run.stdout, "handled\n", "{}", run.stderr);
+    assert_outcome(&run, "miss");
+}
+
+#[test]
 fn statically_linked_programs_are_traced() {
     let ws = Workspace::new();
     let program = r#"package main
