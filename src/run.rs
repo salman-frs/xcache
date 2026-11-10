@@ -397,7 +397,7 @@ fn unrecorded_inputs(cached: &Entry, fresh: &[Input]) -> Vec<String> {
     };
     let as_written = |input: &Input| match (&input.state, written.get(input.path.as_path())) {
         (State::File { mode, content, .. }, Some(OutputState::File { mode: written_mode, content: written, .. })) => {
-            mode == written_mode && content == written
+            mode == written_mode && content.as_ref() == Some(written)
         }
         (State::Dir { .. }, Some(OutputState::Dir { .. })) => true,
         _ => false,
@@ -438,9 +438,10 @@ fn differences(cached: &RunResult, fresh: &RunResult) -> Vec<String> {
 fn describe(state: &State) -> String {
     match state {
         State::Missing => "missing".into(),
-        State::File { size, mode, content } => {
+        State::File { size, mode, content: Some(content) } => {
             format!("{size}-byte file {} with mode {mode:o}", &content.to_hex()[..12])
         }
+        State::File { size, mode, content: None } => format!("unreadable {size}-byte file with mode {mode:o}"),
         State::Dir { real_path, mode } => format!("directory {} with mode {mode:o}", real_path.display()),
         State::Listing { entries, .. } => format!("listing {}", &entries.to_hex()[..12]),
         State::Symlink { target } => format!("symlink to {}", target.display()),

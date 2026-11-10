@@ -10,6 +10,7 @@ use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -359,6 +360,7 @@ enum Pending {
     UntracedChild,
     Accept,
     Connect { fd: i32, destination: Destination },
+    Bind { socket: PathBuf, mutation: Option<Mutation> },
 }
 
 enum Resume {
@@ -375,6 +377,9 @@ struct Tracer<'h> {
     untraced_children: Vec<Pid>,
     opened_connections: HashSet<SocketAddr>,
     known_listeners: net::KnownListeners,
+    /// Sockets the command bound, by device and inode, which renames and links
+    /// to them keep.
+    bound_sockets: HashSet<(u64, u64)>,
 }
 
 impl<'h> Tracer<'h> {
@@ -388,6 +393,7 @@ impl<'h> Tracer<'h> {
             untraced_children: Vec::new(),
             opened_connections: HashSet::new(),
             known_listeners: net::KnownListeners::new(),
+            bound_sockets: HashSet::new(),
         }
     }
 
@@ -551,7 +557,19 @@ impl<'h> Tracer<'h> {
                 }
             }
             Pending::Connect { fd, destination } => self.connected(pid, fd, &destination, result),
-            Pending::Mutations(_) | Pending::Rename { .. } | Pending::UntracedChild | Pending::Accept => {}
+            Pending::Bind { socket, mutation } if succeeded => {
+                if let Some(mutation) = mutation {
+                    self.recorder.mutated(mutation);
+                }
+                if let Ok(meta) = std::fs::metadata(&socket) {
+                    self.bound_sockets.insert((meta.dev(), meta.ino()));
+                }
+            }
+            Pending::Mutations(_)
+            | Pending::Rename { .. }
+            | Pending::UntracedChild
+            | Pending::Accept
+            | Pending::Bind { .. } => {}
         }
     }
 
@@ -672,7 +690,9 @@ impl<'h> Tracer<'h> {
             Call::Accept => Resume::UntilExit(Pending::Accept),
             Call::Bind { addr, len } => match net::read_sockaddr(pid, addr, len) {
                 Some(Destination::UnixPath(path)) => {
-                    self.mutate(&[(tracee::resolve(pid, libc::AT_FDCWD, &path)?, Effect::MakeNode)])
+                    let socket = tracee::resolve(pid, libc::AT_FDCWD, &path)?;
+                    let mutation = self.recorder.before_mutation(&socket, Effect::MakeNode);
+                    Resume::UntilExit(Pending::Bind { socket, mutation })
                 }
                 _ => Resume::Continue,
             },
@@ -727,7 +747,8 @@ impl<'h> Tracer<'h> {
 
     /// A connection that reached no one only showed that nothing was there: no
     /// file at a socket path (nscd's, when nscd is not running), or nothing
-    /// bound to a loopback port. glibc connects datagram sockets, without
+    /// bound to a loopback port. A socket file nobody listens on is not like
+    /// that, because a service can start listening on the same kind of file. glibc connects datagram sockets, without
     /// sending, to sort the addresses getaddrinfo returns.
     fn connected(&mut self, pid: Pid, fd: i32, destination: &Destination, result: i64) {
         let found_nothing = matches!(-result as i32, libc::ENOENT | libc::ENOTDIR | libc::ECONNREFUSED);
@@ -738,9 +759,9 @@ impl<'h> Tracer<'h> {
             self.opened_connections.insert(local);
         }
         match destination {
-            Destination::UnixPath(path) if found_nothing => {
+            Destination::UnixPath(path) if -result == libc::ENOENT as i64 || -result == libc::ENOTDIR as i64 => {
                 if let Some(path) = tracee::resolve(pid, libc::AT_FDCWD, path) {
-                    self.recorder.observe(Access::Lstat, &path);
+                    self.recorder.observe(Access::Stat, &path);
                 }
             }
             Destination::Loopback { port: 0 } => {}
@@ -762,7 +783,8 @@ impl<'h> Tracer<'h> {
 
     fn check_destination(&mut self, pid: Pid, destination: &Destination) {
         if let Destination::UnixPath(path) = destination
-            && tracee::resolve(pid, libc::AT_FDCWD, path).is_some_and(|path| self.recorder.created_by_command(&path))
+            && let Some(meta) = tracee::resolve(pid, libc::AT_FDCWD, path).and_then(|path| std::fs::metadata(path).ok())
+            && self.bound_sockets.contains(&(meta.dev(), meta.ino()))
         {
             return;
         }

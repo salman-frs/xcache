@@ -313,6 +313,22 @@ fn an_unused_loopback_port_is_an_input() {
 }
 
 #[test]
+fn a_socket_file_nobody_listens_on_is_not_cached() {
+    let ws = Workspace::new();
+    drop(std::os::unix::net::UnixListener::bind(ws.path("stale.sock")).unwrap());
+    let script = "import socket\ns = socket.socket(socket.AF_UNIX)\ntry: s.connect('stale.sock')\nexcept OSError: pass";
+    assert_outcome(&ws.run(&["python3", "-c", script]), "not_cached");
+}
+
+#[test]
+fn a_link_it_makes_to_another_service_is_not_its_own() {
+    let ws = Workspace::new();
+    let _service = std::os::unix::net::UnixListener::bind(ws.path("service.sock")).unwrap();
+    let script = "import os, socket\nos.symlink('service.sock', 'mine.sock')\ns = socket.socket(socket.AF_UNIX)\ns.connect('mine.sock')";
+    assert_outcome(&ws.run(&["python3", "-c", script]), "not_cached");
+}
+
+#[test]
 fn talking_to_its_own_local_server_is_cacheable() {
     let ws = Workspace::new();
     let script = "import socket\nserver = socket.create_server(('127.0.0.1', 0))\nclient = socket.create_connection(server.getsockname())\nprint('connected')";
@@ -472,6 +488,34 @@ fn restored_outputs_are_newer_than_the_checkout_they_are_restored_into() {
 }
 
 #[test]
+fn replacing_a_link_to_dev_null_misses() {
+    let ws = Workspace::new();
+    symlink("/dev/null", ws.path("settings")).unwrap();
+    assert_outcome(&ws.sh("cat settings > out.txt"), "miss");
+    fs::remove_file(ws.path("settings")).unwrap();
+    ws.write("settings", "verbose");
+    assert_outcome(&ws.sh("cat settings > out.txt"), "miss");
+    assert_eq!(ws.read("out.txt"), "verbose");
+}
+
+#[test]
+fn checking_a_file_it_may_not_read_still_sees_its_size() {
+    use std::os::unix::fs::PermissionsExt;
+    let ws = Workspace::new();
+    let secret = ws.path("secret");
+    let script = "if [ -s secret ]; then echo nonempty; else echo empty; fi > out.txt";
+    fs::write(&secret, "").unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+    assert_outcome(&ws.sh(script), "miss");
+
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(&secret, "x").unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+    assert_outcome(&ws.sh(script), "miss");
+    assert_eq!(ws.read("out.txt"), "nonempty\n");
+}
+
+#[test]
 fn deletions_are_replayed() {
     let ws = Workspace::new();
     ws.write("stale.txt", "old");
@@ -543,9 +587,9 @@ fn a_same_size_edit_behind_a_modification_time_check_misses() {
 #[test]
 fn fresh_clones_of_the_same_commit_hit_although_git_bookkeeping_differs() {
     let ws = Workspace::new();
-    let git = |dir: &str, args: &[&str]| {
+    let git_as = |user: &str, dir: &str, args: &[&str]| {
         let status = Command::new("git")
-            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main"])
+            .args(["-c", &format!("user.name={user}"), "-c", "user.email=t@t", "-c", "init.defaultBranch=main"])
             .args(args)
             .current_dir(ws.path(dir))
             .output()
@@ -553,14 +597,15 @@ fn fresh_clones_of_the_same_commit_hit_although_git_bookkeeping_differs() {
             .status;
         assert!(status.success(), "git {args:?}");
     };
+    let git = |dir: &str, args: &[&str]| git_as("t", dir, args);
     ws.write("origin/a.txt", "a");
     git("origin", &["init", "-q"]);
     git("origin", &["add", "a.txt"]);
     git("origin", &["commit", "-q", "-m", "a"]);
-    let fresh_clone = || {
+    let fresh_clone = |user: &str| {
         let _ = fs::remove_dir_all(ws.path("src"));
-        git(".", &["clone", "-q", "--no-local", "origin", "src"]);
-        git("src", &["checkout", "-q", "--detach"]);
+        git_as(user, ".", &["clone", "-q", "--no-local", "origin", "src"]);
+        git_as(user, "src", &["checkout", "-q", "--detach"]);
     };
     let status = || {
         ws.run_with(&["git", "status"], |c| {
@@ -568,10 +613,10 @@ fn fresh_clones_of_the_same_commit_hit_although_git_bookkeeping_differs() {
         })
     };
 
-    fresh_clone();
+    fresh_clone("runner");
     assert_outcome(&status(), "miss");
     std::thread::sleep(Duration::from_secs(1));
-    fresh_clone();
+    fresh_clone("another runner");
     let again = status();
     assert_outcome(&again, "hit");
     assert!(again.stdout.contains("HEAD detached"), "{}", again.stdout);

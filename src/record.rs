@@ -271,7 +271,13 @@ impl<'h> Recorder<'h> {
             return;
         }
         let real = real_location(requested);
-        if self.is_excluded(&real) || self.is_owned(&real) || leads_to_machine_state(access, &real) {
+        if self.is_excluded(&real) || self.is_owned(&real) {
+            return;
+        }
+        if leads_to_machine_state(access, &real) {
+            for link in symlink_chain(&real) {
+                self.record_observation(Access::Lstat, &link, true);
+            }
             return;
         }
         // Paths under /proc name the tracee (cwd, fd links); record where they lead.
@@ -351,11 +357,6 @@ impl<'h> Recorder<'h> {
         is_machine_state(real) || self.excluded.iter().any(|excluded| real.starts_with(excluded))
     }
 
-    /// Whether the command created the file at `path`, such as a socket it bound.
-    pub fn created_by_command(&self, path: &Path) -> bool {
-        self.is_owned(&real_location(path))
-    }
-
     fn is_owned(&self, real: &Path) -> bool {
         self.owned_paths.contains(real)
             || self.owned_trees.iter().any(|tree| real.starts_with(tree))
@@ -369,6 +370,21 @@ fn leads_to_machine_state(access: Access, real: &Path) -> bool {
     follows_symlinks
         && fs::symlink_metadata(real).is_ok_and(|meta| meta.is_symlink())
         && fs::canonicalize(real).is_ok_and(|target| is_machine_state(&target))
+}
+
+/// The symlinks a path goes through, up to the first target outside them.
+fn symlink_chain(link: &Path) -> Vec<PathBuf> {
+    let mut chain = Vec::new();
+    let mut path = link.to_path_buf();
+    while chain.len() < 40 && !is_machine_state(&path) {
+        let Ok(target) = fs::read_link(&path) else {
+            break;
+        };
+        let next = real_location(&path.parent().unwrap_or(Path::new("/")).join(target));
+        chain.push(path);
+        path = next;
+    }
+    chain
 }
 
 fn is_machine_state(real: &Path) -> bool {
@@ -563,15 +579,15 @@ mod tests {
     }
 
     #[test]
-    fn symlinks_into_proc_are_not_inputs() {
+    fn links_into_proc_are_recorded_but_not_followed() {
         let mut scenario = Scenario::new();
         let mtab = scenario.path("mtab");
         std::os::unix::fs::symlink("/proc/self/mounts", &mtab).unwrap();
         let mut recorder = scenario.recorder();
         recorder.observe(Access::Read, &mtab);
-        recorder.observe(Access::Lstat, &mtab);
         let recording = recorder.finish();
         assert_eq!(recording.inputs.len(), 1);
+        assert_eq!(recording.inputs[0].access, Access::Lstat);
         assert_eq!(recording.inputs[0].state, State::Symlink { target: "/proc/self/mounts".into() });
     }
 }
