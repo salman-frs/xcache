@@ -1,0 +1,26 @@
+# A Linux VM with what the tests need. From the repository root:
+#   limactl start --name=xcache --mount="$PWD:w" --yes dev/lima.yaml
+#   limactl shell xcache cargo test
+minimumLimaVersion: 2.0.0
+
+base:
+- template:_images/ubuntu-24.04
+
+cpus: 4
+memory: 4GiB
+
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y build-essential curl git golang-go python3
+    # Each VM builds into its own home, so VMs of other architectures can share the mounted checkout.
+    echo 'export CARGO_TARGET_DIR="$HOME/target"' > /etc/profile.d/cargo-target-dir.sh
+- mode: user
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --component clippy,rustfmt

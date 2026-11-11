@@ -1,0 +1,35 @@
+name: False hit
+description: xcache restored a result that differs from what the command produces
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A false hit is the worst bug xcache can have, so thank you. The report from `xcache run --shadow` usually names the input xcache missed.
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: The command you ran under `xcache run`, and the project it builds if it is public.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Report
+      description: The JSON that `xcache run --shadow --report report.json -- <command>` wrote.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: difference
+    attributes:
+      label: What differed
+      description: The file or output that was wrong, and what changed between the cached run and this one, if you know.
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: The output of `xcache --version` and `uname -srm`.
+    validations:
+      required: true

@@ -30,7 +30,7 @@ The commits are the pinned commit and the first-parent commits before it.
 
 - **False hits**: shadow runs whose verdict was `false_hit`, with the inputs
   the cached run missed. Each one that gives a wrong result is a bug, and gets
-  a test in [tests/traps.rs](../tests/traps.rs).
+  a test in [tests/traps/](../tests/traps).
 - **Cacheable**: steps whose cold run was stored, out of all steps. The
   summary groups the reasons the others were not stored.
 - **Miss overhead**: wall time of the cold phase over the baseline, both
@@ -61,9 +61,9 @@ python3 corpus/corpus.py report corpus/results/*.json
 ```
 
 `run` writes `corpus/results/<project>-<arch>.json`, plus the logs and xcache
-reports of every step under `corpus/results/logs/`. It works in `/tmp/xcache-corpus` and
-deletes each project's directory when the project is done, unless you pass
-`--keep`.
+reports of every step under `corpus/results/logs/`. It works in
+`/tmp/xcache-corpus` and deletes each project's directory when the project is
+done, unless you pass `--keep`.
 
 A full run takes about two hours, so pushes and pull requests don't start one.
 Before merging a change to tracing, restoring or the corpus, run it on the
@@ -80,3 +80,6 @@ Pick a project whose tests pass offline once its dependencies are installed,
 pin `rev` to a commit on its default branch, and list the commands a CI job
 would run as `steps`. Put dependency downloads in `setup` (every phase) or
 `prime` (once). A project that fails without xcache measures nothing.
+
+`python3 -m unittest discover -s corpus` checks the project list and the
+summary. CI runs it, and formats and lints the harness with ruff.
