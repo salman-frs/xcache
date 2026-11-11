@@ -9,10 +9,6 @@ on:
         default: ""
   schedule:
     - cron: "17 3 * * 1"
-  push:
-    paths:
-      - corpus/**
-      - .github/workflows/corpus.yml
 
 permissions:
   contents: read

@@ -4,7 +4,7 @@ The corpus measures xcache on the build and test steps of popular open source
 projects, so we know whether it is correct and worth using on real builds. The
 projects are listed in [corpus/projects.toml](../corpus/projects.toml), pinned
 to a commit, and the [Corpus workflow](../.github/workflows/corpus.yml) runs
-each of them on x86_64 and aarch64 every week and whenever the corpus changes.
+each of them on x86_64 and aarch64 every week, and on demand.
 [corpus-results.md](corpus-results.md) has the latest results.
 
 ## What a run does
@@ -65,10 +65,13 @@ reports of every step under `corpus/results/logs/`. It works in `/tmp/xcache-cor
 deletes each project's directory when the project is done, unless you pass
 `--keep`.
 
-To run the workflow on GitHub for some of the projects:
+A full run takes about two hours, so pushes and pull requests don't start one.
+Before merging a change to tracing, restoring or the corpus, run it on the
+branch, for all projects or some of them:
 
 ```sh
-gh workflow run corpus.yml -f projects="koa zlib"
+gh workflow run corpus.yml --ref my-branch
+gh workflow run corpus.yml --ref my-branch -f projects="koa zlib"
 ```
 
 ## Adding a project
