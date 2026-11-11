@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/salman-frs/xcache"
-description = "Skips commands whose inputs have not changed, finding the inputs by tracing system calls"
+description = "Cache for arbitrary commands that finds their inputs by tracing system calls"
 keywords = ["cache", "ci", "build", "ptrace"]
 categories = ["command-line-utilities", "development-tools::build-utils"]
 

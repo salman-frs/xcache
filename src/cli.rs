@@ -11,7 +11,11 @@ use crate::store::Store;
 const INTERNAL_ERROR: i32 = 125;
 
 #[derive(Parser)]
-#[command(name = "xcache", version, about = "Skip commands whose inputs have not changed, with no configuration")]
+#[command(
+    name = "xcache",
+    version,
+    about = "Cache for arbitrary commands that finds their inputs by tracing system calls"
+)]
 struct Cli {
     /// Cache directory [default: $XDG_CACHE_HOME/xcache or ~/.cache/xcache]
     #[arg(long, env = "XCACHE_DIR", global = true, value_name = "DIR")]
