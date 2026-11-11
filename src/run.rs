@@ -14,6 +14,7 @@ use crate::invocation::Invocation;
 use crate::observe::{self, Access, State};
 use crate::outputs;
 use crate::record::Recorder;
+use crate::stdio;
 use crate::store::{Entry, Input, RunResult, Store, unix_now};
 use crate::trace::{self, Exit, Outcome};
 
@@ -301,7 +302,7 @@ fn execute(invocation: &Invocation, store: &Store, hasher: &mut ContentHasher) -
 fn replay(entry: &Entry, store: &Store) -> Result<()> {
     let stdio = store.read_blob(entry.result.stdio).context("reading recorded output")?;
     outputs::restore(&entry.result.outputs, store)?;
-    trace::replay_output(&stdio).context("replaying output")?;
+    stdio::replay(&stdio).context("replaying output")?;
     Ok(())
 }
 

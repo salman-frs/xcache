@@ -10,5 +10,6 @@ mod outputs;
 mod path_serde;
 mod record;
 mod run;
+mod stdio;
 mod store;
 mod trace;
