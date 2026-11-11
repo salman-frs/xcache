@@ -40,7 +40,7 @@ is the one a fresh run produces; only cargo's fingerprint files differ. The
 cost is that a cargo command that misses after a hit redoes that package once.
 
 Every false hit the corpus found along the way was either an xcache bug, now
-fixed with a test in [tests/traps.rs](../tests/traps.rs), or a gap in how shadow
+fixed with a test in [tests/traps/](../tests/traps), or a gap in how shadow
 mode compared runs:
 
 | Found in | Cause | Test |
@@ -51,10 +51,6 @@ mode compared runs:
 | cargo and cmake in shadow mode | restored outputs were older than a fresh checkout's sources | `restored_outputs_are_newer_than_the_checkout_they_are_restored_into` |
 | go test, cargo test in shadow mode | shadow mode left fresh-only files, lost hard links and kept the fresh result | `shadow_mode_leaves_what_a_hit_would_so_later_commands_see_the_same_files`, `shadow_mode_removes_files_only_the_fresh_run_created` |
 | Gradle, cargo, kotlinpoet in shadow mode | reads the cached run did as checks, or of files it had overwritten, counted as unrecorded | `reading_what_the_cached_run_only_checked_is_not_a_false_hit`, `reading_a_file_the_cached_run_overwrote_unseen_is_not_a_false_hit` |
-
-A review of the branch found further gaps, also fixed with tests: symlinks into
-`/dev`, sockets reached through links the command made, unreadable files,
-loopback ports compared without their address, and times set with `touch -d`.
 
 ## What is not cacheable
 

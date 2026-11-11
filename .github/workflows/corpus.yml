@@ -44,8 +44,9 @@ jobs:
       - id: list
         env:
           PROJECTS: ${{ inputs.projects }}
-        # PROJECTS is split into names on purpose.
-        run: echo "projects=$(python3 corpus/corpus.py list $PROJECTS)" >> "$GITHUB_OUTPUT"
+        run: |
+          # shellcheck disable=SC2086 # PROJECTS is split into names on purpose.
+          echo "projects=$(python3 corpus/corpus.py list $PROJECTS)" >> "$GITHUB_OUTPUT"
 
   measure:
     name: ${{ matrix.project.name }} (${{ matrix.runner }})

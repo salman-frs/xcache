@@ -42,8 +42,12 @@ runs the command and records it. Either way the exit status is the command's.
 
 ### Finding out why a command missed
 
-`xcache explain -- <command>` shows why a command would miss: for each cached
-result, the first input that no longer matches.
+`xcache explain -- <command>` shows, for each cached result, the first input
+that no longer matches.
+
+`xcache run --report <file>` writes a JSON summary of the run: whether it hit,
+why it was not cached, how many inputs and outputs it had, and where the time
+went.
 
 ### Checking the cache with shadow mode
 
@@ -59,10 +63,10 @@ the cache with a new project. It reports one of:
   record. That is a bug in xcache. Please open an issue with the `--report`
   output.
 
-Unless it finds a false hit, shadow mode then leaves the cached files and exit
-status in place, as a hit would, so the commands after it see the same files
-with and without `--shadow`. After a false hit it keeps the fresh result and
-removes the wrong entry from the cache.
+Unless it finds a false hit, shadow mode then leaves the cached result in
+place, as a hit would, so later commands see the same files with and without
+`--shadow`. After a false hit it keeps the fresh result and removes the wrong
+entry.
 
 ### Environment variables
 
@@ -108,13 +112,8 @@ reads them never hits. Turn them off in jobs that use xcache:
 ### Cache location and size
 
 The cache is stored in `$XCACHE_DIR`, or `$XDG_CACHE_HOME/xcache`, or
-`~/.cache/xcache`.
-
-`xcache gc --max-size 2G` drops the least recently used results until the
-cache fits.
-
-`--report <file>` writes a JSON summary of a run: whether it hit, why it was
-not cached, how many inputs and outputs it had, and where the time went.
+`~/.cache/xcache`. `xcache gc --max-size 2G` drops the least recently used
+results until the cache fits.
 
 ## What is not cached
 
@@ -141,15 +140,13 @@ appears there later.
   timestamp into a file, a cache hit restores the old timestamp.
 - Reads under `/proc`, `/sys` and `/dev` (except `/dev/shm`) are not tracked.
   CPU counts and cgroup limits count as properties of the machine.
-- Restored files get the recorded content and permissions, and modification
-  times in the order the original run left them, ending at the time of the
-  restore. Their owner is the current user.
-- A `stat` of a file records its content, which stands in for its modification
-  time: make, ninja and git compare times, and times change on every checkout.
-  Touching a file without changing it doesn't cause a miss.
-- Git's index and reflogs are compared without the stat data, times and
-  identities they keep about the checkout. Like the clock, a command that
-  prints reflog dates or names gets the cached ones on a hit.
+- Files are compared by content, never by modification time, so touching a
+  file without changing it doesn't cause a miss. Restored files are dated in
+  the order the original run left them, ending at the time of the restore, and
+  are owned by the current user.
+- Git's index and reflogs are compared without the times and identities they
+  keep about the checkout, so a command that prints reflog dates or names gets
+  the cached ones on a hit.
 - A miss is slower than running the command directly, because every traced
   system call stops in xcache. See [Performance](#performance).
 - Many tools check whether their outputs exist, so in a working tree that
@@ -189,9 +186,8 @@ rewritten is recorded with its original content.
 
 Each stored result lists its inputs with the state they had. A lookup checks
 those states against the filesystem and restores the first result that
-matches.
-
-[docs/design.md](docs/design.md) has the details.
+matches. [docs/design.md](docs/design.md) has the details and a map of the
+code.
 
 ## Roadmap
 
@@ -207,7 +203,6 @@ writing a cache key. Roughly in order:
   run.
 - Signed cache entries, and read-only access for untrusted pull requests.
 - [SLSA](https://slsa.dev/) provenance built from the recorded inputs.
-- macOS hosts.
 
 ## Related work
 
@@ -222,16 +217,18 @@ writing a cache key. Roughly in order:
 
 ## Development
 
-The tests need `sh`, `gcc`, `go`, `python3` and `git`:
+The tests need Linux with `sh`, `gcc`, `go`, `python3` and `git`.
+[dev/lima.yaml](dev/lima.yaml) describes a VM that has them.
 
 ```sh
 cargo test
 ```
 
-Most of the tests in [tests/traps.rs](tests/traps.rs) try to make xcache
-return a wrong result, for example with a header that shadows another on the
-include path or a file rewritten in place. A fix for a false hit should start
-with a new test there.
+Most of the tests in [tests/traps/](tests/traps) try to make xcache return a
+wrong result, for example with a header that shadows another on the include
+path or a file rewritten in place. A fix for a false hit should start with a
+new test there. CI runs them on x86_64 and aarch64, since x86_64 also has the
+older system calls and the 32-bit ABI.
 
 ## License
 

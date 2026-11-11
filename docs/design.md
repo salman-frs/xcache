@@ -19,6 +19,24 @@ those calls gives the complete list of paths the command looked at. The inputs
 that don't go through a system call are the clock, randomness, and whatever
 the command reads under `/proc`, `/sys` and `/dev`. xcache doesn't track those.
 
+## Code map
+
+| File in `src/` | What it does |
+|---|---|
+| `main.rs`, `lib.rs` | Entry point; the library only exposes `cli` |
+| `cli.rs` | Command line and exit statuses |
+| `run/` | The `run` and `explain` commands: lookup and restore (`mod.rs`), running a miss (`execute.rs`), shadow mode (`shadow.rs`) and the `--report` JSON (`report.rs`) |
+| `invocation.rs` | The fingerprint of a command line, working directory and environment |
+| `trace/` | The tracer: starting the command (`spawn.rs`), the seccomp filter (`filter.rs`), decoding system calls (`syscalls.rs`), what each one records (`handle.rs`), reading the tracee's memory (`tracee.rs`) and checking sockets (`net.rs`) |
+| `record.rs` | Turning system calls into inputs and outputs |
+| `observe.rs` | Kinds of access, the state each records, and probing a path's current state |
+| `git.rs` | Digests of git's index and reflogs |
+| `outputs.rs` | Capturing outputs after a run and restoring them on a hit |
+| `stdio.rs` | Forwarding, recording and replaying stdout and stderr |
+| `store.rs` | The cache directory and the entries in it |
+| `digest.rs` | Content digests and the stat cache |
+| `path_serde.rs` | Paths that are not UTF-8 in JSON |
+
 ## Lookup
 
 The invocation is hashed into a fingerprint (`invocation.rs`). Each field is
@@ -129,9 +147,9 @@ modification, so `a` is hashed before the link is made.
 
 After a successful write, the path and its inode belong to the command, and
 reading them later is not an input. If `make` compiles `foo.c` into `foo.o`
-and then links `foo.o`, the input is `foo.c` and `foo.o` is an output. Directories the
-command created, and directories it renamed into place, are owned along with
-everything under them.
+and then links `foo.o`, the input is `foo.c` and `foo.o` is an output.
+Directories the command created, and directories it renamed into place, are
+owned along with everything under them.
 
 Ownership is checked against the path's real location: its parent directory
 with symlinks and `..` resolved, plus the file name. Without that,
@@ -176,7 +194,7 @@ instead.
 
 ### Starting the command
 
-`trace/mod.rs` forks. The child:
+`trace/spawn.rs` forks. The child:
 
 1. connects stdin to `/dev/null`;
 2. connects stdout and stderr to pipes, which xcache forwards and records;
@@ -200,9 +218,9 @@ built before it.
    `ENOSYS`, because io_uring can read files without a system call per
    file. Most programs that get `ENOSYS` fall back to normal calls.
 3. The filesystem calls, plus `connect`, `sendto`, `sendmsg`, `accept`,
-   `clone`, `unshare` and the mount calls, stop in the tracer: 44 calls on
-   aarch64 and 59 on x86_64, which still has `open`, `stat` and the other
-   calls without `at`.
+   `clone`, `unshare` and the mount calls, stop in the tracer. x86_64 also
+   has `open`, `stat` and the other calls without `at`. `trace/syscalls.rs`
+   lists them.
 4. Everything else runs without stopping.
 
 ### Handling a stop
@@ -213,11 +231,11 @@ arguments are read with `process_vm_readv`, one page at a time
 (`trace/tracee.rs`).
 
 Reads and probes are recorded when the call starts, and the process continues
-right away. A few calls also stop when they return, because the result decides
-what gets recorded: writes are only recorded if they succeeded, a failed
-`execve` is recorded as a missing path, `accept` returns the connection whose
-peer has to be checked, and `clone` with `CLONE_UNTRACED` returns the process
-that has to be killed at the end.
+right away (`trace/handle.rs`). A few calls also stop when they return,
+because the result decides what gets recorded: writes are only recorded if
+they succeeded, a failed `execve` is recorded as a missing path, `accept`
+returns the connection whose peer has to be checked, and `clone` with
+`CLONE_UNTRACED` returns the process that has to be killed at the end.
 
 ### Processes
 
@@ -248,23 +266,18 @@ An accepted TCP connection gets the same check from the other side.
 ## Shadow mode
 
 `--shadow` runs the command on a hit, records it, and compares the two
-results (`run.rs`). If they differ, or the fresh run is not cacheable:
+results (`run/shadow.rs`). When they differ, or the fresh run can't be
+cached, the verdict depends on the inputs: `nondeterministic` if the fresh run read the same inputs with the
+same states as the cached run, `false_hit` if it read something the cached run
+didn't. Paths that didn't exist are left out of this comparison, because
+programs pick random names for temporary files.
 
-- `nondeterministic` means the fresh run read the same inputs, with the same
-  states, as the cached run;
-- `false_hit` means it read something the cached run didn't.
-
-Paths that didn't exist are ignored in this comparison. Programs pick random
-names for temporary files, so every run checks different missing paths.
-
-When the result is `correct` or `nondeterministic`, xcache restores the cached
-outputs and exits with the cached status, as a hit would. Otherwise every
-nondeterministic command would change the inputs of the commands after it, and
-those commands would miss under `--shadow` where they hit without it, so their
-hits would never be checked. Files only the fresh run created are removed, but
-a file it changed that the cached run left alone keeps the change, since its
-earlier content was not stored. A false hit keeps the fresh result, and the
-entry that produced it is removed so that later runs can't reuse it.
+Leaving the cached result in place after a `nondeterministic` verdict keeps
+the commands that follow on the inputs a hit would give them. Otherwise they
+would miss under `--shadow` where they hit without it, and their hits would
+never be checked. Files only the fresh run created are removed, but a file it
+changed that the cached run left alone keeps the change, since its earlier
+content was not stored.
 
 ## Store
 
@@ -276,6 +289,12 @@ $XCACHE_DIR/
   tmp/                     blobs being written
   lock                     flock taken for entry updates and gc
 ```
+
+Entries carry the version of their format (`FORMAT` in `store.rs`), and
+lookups ignore entries of any other version. A change to what an entry, an
+input state, an output or the recorded stdout and stderr mean needs a new
+version, or lookups would read old entries by new rules. The fingerprint
+(`invocation.rs`) and the stat cache (`digest.rs`) have versions of their own.
 
 Blobs are named by the BLAKE3 digest of their uncompressed content. They are
 not fsynced; every read checks the digest instead. Entry files are rewritten
@@ -290,13 +309,6 @@ file on another machine, and CI can copy the cache directory to one.
 `gc` keeps the most recently used entries that fit in the size budget, deletes
 blobs that no remaining entry uses, and deletes stat caches from other boots.
 
-## Tests
-
-`tests/traps.rs` sets up cases where a cache that missed some input would
-return the wrong result, and checks that xcache doesn't. It runs on x86_64 and
-aarch64; x86_64 has the older system calls and the 32-bit ABI to cover as
-well.
-
 ## Open problems
 
 - Overhead. Every traced call waits for a round trip to the tracer. A tracer
@@ -307,6 +319,3 @@ well.
   fanotify or eBPF could.
 - The clock and randomness can't be observed without kernel changes. Shadow
   mode shows how much they matter for a project but doesn't fix them.
-- A shared cache needs signed entries and read-only access for untrusted
-  builds before it is safe.
-- macOS hosts need a different tracing mechanism.

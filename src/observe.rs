@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fmt;
 use std::fs::{self, FileType};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -60,6 +61,24 @@ pub enum State {
     },
 }
 
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            State::Missing => f.write_str("missing"),
+            State::File { size, mode, content: Some(content) } => {
+                write!(f, "{size}-byte file {} with mode {mode:o}", &content.to_hex()[..12])
+            }
+            State::File { size, mode, content: None } => write!(f, "unreadable {size}-byte file with mode {mode:o}"),
+            State::Dir { real_path, mode } => write!(f, "directory {} with mode {mode:o}", real_path.display()),
+            State::Listing { entries, .. } => write!(f, "listing {}", &entries.to_hex()[..12]),
+            State::Symlink { target } => write!(f, "symlink to {}", target.display()),
+            State::Writable { parent_is_dir, is_dir } => write!(f, "parent_is_dir={parent_is_dir} is_dir={is_dir}"),
+            State::Special { kind } => write!(f, "{}", format!("{kind:?}").to_lowercase()),
+            State::Error { errno } => write!(f, "{}", io::Error::from_raw_os_error(*errno)),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpecialKind {
@@ -105,11 +124,7 @@ pub type Listing = BTreeMap<OsString, EntryKind>;
 
 pub fn probe(access: Access, path: &Path, hasher: &mut ContentHasher) -> State {
     match access {
-        Access::Read => match fs::metadata(path) {
-            Ok(meta) => describe(access, path, &meta, hasher),
-            Err(error) => from_error(&error),
-        },
-        Access::Stat => match fs::metadata(path) {
+        Access::Read | Access::Stat => match fs::metadata(path) {
             Ok(meta) => describe(access, path, &meta, hasher),
             Err(error) => from_error(&error),
         },
@@ -143,8 +158,12 @@ pub fn file_metadata_matches(access: Access, path: &Path, state: &State) -> bool
     let State::File { size, mode, .. } = state else {
         return false;
     };
-    let meta = if access == Access::Lstat { fs::symlink_metadata(path) } else { fs::metadata(path) };
-    meta.is_ok_and(|meta| meta.is_file() && recorded_size(path, &meta) == *size && permission_bits(&meta) == *mode)
+    metadata(access, path)
+        .is_ok_and(|meta| meta.is_file() && recorded_size(path, &meta) == *size && permission_bits(&meta) == *mode)
+}
+
+pub fn metadata(access: Access, path: &Path) -> io::Result<fs::Metadata> {
+    if access == Access::Lstat { fs::symlink_metadata(path) } else { fs::metadata(path) }
 }
 
 /// Git's bookkeeping files are compared by a digest that leaves out what

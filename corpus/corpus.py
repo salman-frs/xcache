@@ -195,7 +195,14 @@ class Workspace:
             GRADLE_USER_HOME=f"{home}/.gradle",
             npm_config_cache=f"{home}/.npm",
         )
-        for name in ("GOCACHE", "GOMODCACHE", "UV_CACHE_DIR", "PIP_CACHE_DIR", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"):
+        for name in (
+            "GOCACHE",
+            "GOMODCACHE",
+            "UV_CACHE_DIR",
+            "PIP_CACHE_DIR",
+            "CARGO_TARGET_DIR",
+            "CARGO_BUILD_TARGET_DIR",
+        ):
             env.pop(name, None)
         env.update(self.project.env)
         return env
@@ -213,7 +220,9 @@ def run_project(project: Project, xcache: Path, work: Path, results: Path) -> di
         "repo": project.repo,
         "ecosystem": project.ecosystem,
         "arch": platform.machine(),
-        "xcache": subprocess.run([str(xcache), "--version"], capture_output=True, text=True).stdout.strip(),
+        "xcache": subprocess.run(
+            [str(xcache), "--version"], check=False, capture_output=True, text=True
+        ).stdout.strip(),
         "steps": project.steps,
         "commits": [],
         "runs": [],
@@ -269,8 +278,15 @@ def run_logged(argv: list[str], cwd: Path, env: dict[str, str], log: Path) -> in
     with log.open("ab") as output:
         output.write(f"$ {shlex.join(argv)}\n".encode())
         output.flush()
-        process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=output,
-                                   stderr=subprocess.STDOUT, start_new_session=True)
+        process = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
         try:
             return process.wait(timeout=STEP_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
@@ -342,17 +358,27 @@ def summarize_project(result: dict) -> ProjectSummary:
     both = [step for step in cold if step in baseline]
     miss_overhead = ratio(sum(cold[s]["wall_ms"] for s in both), sum(baseline[s]["wall_ms"] for s in both))
     warm_hit_steps = [step for step, run in warm.items() if run["xcache"]["outcome"] == "hit"]
-    hit_speedup = ratio(sum(baseline[s]["wall_ms"] for s in warm_hit_steps if s in baseline),
-                        sum(warm[s]["wall_ms"] for s in warm_hit_steps))
+    hit_speedup = ratio(
+        sum(baseline[s]["wall_ms"] for s in warm_hit_steps if s in baseline),
+        sum(warm[s]["wall_ms"] for s in warm_hit_steps),
+    )
 
     def finding(run: dict) -> dict:
-        return {"phase": run["phase"], "commit": run["commit"], "step": run["step"],
-                "differences": run["xcache"].get("differences", [])}
+        return {
+            "phase": run["phase"],
+            "commit": run["commit"],
+            "step": run["step"],
+            "differences": run["xcache"].get("differences", []),
+        }
 
     shadowed = [run for run in runs if run.get("xcache", {}).get("shadow")]
     changed_exit = [
-        {"phase": run["phase"], "step": run["step"], "baseline": baseline[run["step"]]["exit_code"],
-         "xcache": run["exit_code"]}
+        {
+            "phase": run["phase"],
+            "step": run["step"],
+            "baseline": baseline[run["step"]]["exit_code"],
+            "xcache": run["exit_code"],
+        }
         for phase in (cold, warm)
         for run in phase.values()
         if run["step"] in baseline and run["exit_code"] != baseline[run["step"]]["exit_code"]
@@ -385,7 +411,9 @@ def reason_category(reason: str) -> str:
     reason = re.sub(r" \(.*\)$", "", reason)
     reason = re.sub(r"exited with status \d+", "exited with a non-zero status", reason)
     reason = re.sub(r"^network access to .*", "network access", reason)
-    reason = re.sub(r"^accepted a connection from [0-9a-f.:\[\]]+$", "accepted a connection from another machine", reason)
+    reason = re.sub(
+        r"^accepted a connection from [0-9a-f.:\[\]]+$", "accepted a connection from another machine", reason
+    )
     return reason.split(": ", 1)[0]
 
 
@@ -419,13 +447,17 @@ def render_report(summaries: list[ProjectSummary]) -> str:
     lines = [
         "# xcache shadow corpus",
         "",
-        f"- Projects: {len({s.name for s in summaries})} ({len(summaries)} runs across "
-        f"{', '.join(sorted({s.arch for s in summaries}))})",
+        (
+            f"- Projects: {len({s.name for s in summaries})} ({len(summaries)} runs across "
+            f"{', '.join(sorted({s.arch for s in summaries}))})"
+        ),
         f"- False hits: **{false_hits}**",
         f"- Cacheable steps: **{percent(share)}** ({cacheable} of {steps})",
         f"- Median overhead on a miss: **{percent(median(overheads))}**",
-        f"- Hit rate across consecutive commits: **{percent(ratio(commit_hits, commit_runs))}** "
-        f"({commit_hits} of {commit_runs} step runs)",
+        (
+            f"- Hit rate across consecutive commits: **{percent(ratio(commit_hits, commit_runs))}** "
+            f"({commit_hits} of {commit_runs} step runs)"
+        ),
         "",
         f"Decision: {decision(false_hits, share)}",
         "",
@@ -452,12 +484,19 @@ def render_report(summaries: list[ProjectSummary]) -> str:
     for s in sorted(summaries, key=lambda s: (s.ecosystem, s.name, s.arch)):
         notes = []
         notes += [f"- not cacheable: `{step}`: {'; '.join(reasons)}" for step, reasons in s.not_cacheable.items()]
-        notes += [f"- **false hit** in {f['phase']} at {f['commit'][:12]}, `{f['step']}`: "
-                  f"{'; '.join(f['differences'][:5])}" for f in s.false_hits]
-        notes += [f"- nondeterministic in {f['phase']}, `{f['step']}`: {'; '.join(f['differences'][:3])}"
-                  for f in s.nondeterministic]
-        notes += [f"- **exit status changed** in {c['phase']}, `{c['step']}`: {c['baseline']} without xcache, "
-                  f"{c['xcache']} with it" for c in s.changed_exit_status]
+        notes += [
+            f"- **false hit** in {f['phase']} at {f['commit'][:12]}, `{f['step']}`: {'; '.join(f['differences'][:5])}"
+            for f in s.false_hits
+        ]
+        notes += [
+            f"- nondeterministic in {f['phase']}, `{f['step']}`: {'; '.join(f['differences'][:3])}"
+            for f in s.nondeterministic
+        ]
+        notes += [
+            f"- **exit status changed** in {c['phase']}, `{c['step']}`: {c['baseline']} without xcache, "
+            f"{c['xcache']} with it"
+            for c in s.changed_exit_status
+        ]
         notes += [f"- harness error: {error}" for error in s.errors]
         if notes:
             lines += [f"### {s.name} ({s.arch})", "", *notes, ""]
