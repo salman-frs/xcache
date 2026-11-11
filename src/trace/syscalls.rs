@@ -16,8 +16,9 @@ pub enum Call {
     Symlink { new_dirfd: i32, new: u64 },
     Chmod { dirfd: i32, path: u64 },
     ChmodFd { fd: i32 },
+    SetTimes { dirfd: i32, path: u64, flags: u64, times: u64, timespecs: bool },
     Truncate { path: u64, length: u64 },
-    Connect { addr: u64, len: u64 },
+    Connect { fd: i32, addr: u64, len: u64 },
     SendTo { addr: u64, len: u64 },
     SendMsg { msg: u64 },
     SendMmsg { msgs: u64, count: u64 },
@@ -25,6 +26,7 @@ pub enum Call {
     Clone3 { args: u64 },
     Unshare { flags: u64 },
     Accept,
+    Bind { addr: u64, len: u64 },
     Unsupported(&'static str),
 }
 
@@ -54,8 +56,9 @@ pub fn decode(nr: u64, args: [u64; 6]) -> Option<Call> {
         libc::SYS_symlinkat => Call::Symlink { new_dirfd: fd(1), new: a2 },
         libc::SYS_fchmodat | FCHMODAT2 => Call::Chmod { dirfd: fd(0), path: a1 },
         libc::SYS_fchmod => Call::ChmodFd { fd: fd(0) },
+        libc::SYS_utimensat => Call::SetTimes { dirfd: fd(0), path: a1, flags: a3, times: a2, timespecs: true },
         libc::SYS_truncate => Call::Truncate { path: a0, length: a1 },
-        libc::SYS_connect => Call::Connect { addr: a1, len: a2 },
+        libc::SYS_connect => Call::Connect { fd: fd(0), addr: a1, len: a2 },
         libc::SYS_sendto => Call::SendTo { addr: a4, len: args[5] },
         libc::SYS_sendmsg => Call::SendMsg { msg: a1 },
         libc::SYS_sendmmsg => Call::SendMmsg { msgs: a1, count: a2 },
@@ -64,6 +67,7 @@ pub fn decode(nr: u64, args: [u64; 6]) -> Option<Call> {
         libc::SYS_unshare => Call::Unshare { flags: a0 },
         libc::SYS_setns => Call::Unsupported("joins another Linux namespace"),
         libc::SYS_accept | libc::SYS_accept4 => Call::Accept,
+        libc::SYS_bind => Call::Bind { addr: a1, len: a2 },
         libc::SYS_mount
         | libc::SYS_umount2
         | libc::SYS_pivot_root
@@ -103,6 +107,12 @@ fn decode_legacy(nr: c_long, args: [u64; 6]) -> Option<Call> {
         libc::SYS_link => Call::Link { old_dirfd: AT_FDCWD, old: a0, new_dirfd: AT_FDCWD, new: a1, flags: 0 },
         libc::SYS_symlink => Call::Symlink { new_dirfd: AT_FDCWD, new: a1 },
         libc::SYS_chmod => Call::Chmod { dirfd: AT_FDCWD, path: a0 },
+        libc::SYS_utime | libc::SYS_utimes => {
+            Call::SetTimes { dirfd: AT_FDCWD, path: a0, flags: 0, times: a1, timespecs: false }
+        }
+        libc::SYS_futimesat => {
+            Call::SetTimes { dirfd: a0 as i32, path: a1, flags: 0, times: args[2], timespecs: false }
+        }
         _ => return None,
     };
     Some(call)
@@ -131,6 +141,7 @@ pub fn traced() -> Vec<c_long> {
         libc::SYS_fchmodat,
         FCHMODAT2,
         libc::SYS_fchmod,
+        libc::SYS_utimensat,
         libc::SYS_truncate,
         libc::SYS_connect,
         libc::SYS_sendto,
@@ -142,6 +153,7 @@ pub fn traced() -> Vec<c_long> {
         libc::SYS_setns,
         libc::SYS_accept,
         libc::SYS_accept4,
+        libc::SYS_bind,
         libc::SYS_mount,
         libc::SYS_umount2,
         libc::SYS_open_tree,
@@ -174,6 +186,9 @@ pub fn traced() -> Vec<c_long> {
         libc::SYS_link,
         libc::SYS_symlink,
         libc::SYS_chmod,
+        libc::SYS_utime,
+        libc::SYS_utimes,
+        libc::SYS_futimesat,
     ];
     common.into_iter().chain(legacy).collect()
 }

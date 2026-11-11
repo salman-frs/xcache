@@ -2,24 +2,40 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read};
+use std::num::NonZeroUsize;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::git;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Digest([u8; 32]);
 
 impl Digest {
-    #[cfg(test)]
     pub fn of_bytes(bytes: &[u8]) -> Self {
         Self(*blake3::hash(bytes).as_bytes())
     }
 
-    pub fn of_reader(reader: impl Read) -> io::Result<Self> {
+    /// Large files are hashed on all CPUs, a chunk at a time.
+    pub fn of_file(mut file: &File, size: u64) -> io::Result<Self> {
         let mut hasher = blake3::Hasher::new();
-        hasher.update_reader(reader)?;
+        if size < PARALLEL_HASHING_MIN {
+            hasher.update_reader(file)?;
+            return Ok(Self::of_hasher(&hasher));
+        }
+        let mut chunk = vec![0; PARALLEL_HASHING_CHUNK];
+        loop {
+            let filled = read_up_to(&mut file, &mut chunk)?;
+            if filled == 0 {
+                break;
+            }
+            hasher.update_rayon(&chunk[..filled]);
+        }
         Ok(Self::of_hasher(&hasher))
     }
 
@@ -63,9 +79,11 @@ impl<'de> Deserialize<'de> for Digest {
 
 pub struct ContentHasher {
     cache_path: Option<PathBuf>,
-    known: HashMap<(u64, u64), Known>,
+    known: HashMap<FileKey, Known>,
     dirty: bool,
 }
+
+type FileKey = (u64, u64);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Stamp {
@@ -78,9 +96,13 @@ struct Stamp {
 struct Known {
     stamp: Stamp,
     digest: Digest,
+    /// Unsettled digests are only trusted within this process.
+    settled: bool,
 }
 
-const CACHE_MAGIC: &[u8] = b"xcache-stat-v1\n";
+const PARALLEL_HASHING_MIN: u64 = 4 << 20;
+const PARALLEL_HASHING_CHUNK: usize = 4 << 20;
+const CACHE_MAGIC: &[u8] = b"xcache-stat-v2\n";
 const RECORD_LEN: usize = 8 * 7 + 32;
 const MAX_KNOWN: usize = 500_000;
 // Matches git's "racy" guard: a file touched within the timestamp granularity
@@ -113,23 +135,44 @@ impl ContentHasher {
     }
 
     pub fn hash_file(&mut self, path: &Path) -> io::Result<Digest> {
-        let file = File::open(path)?;
-        let before = file.metadata()?;
-        let key = (before.dev(), before.ino());
-        let stamp = Stamp::of(&before);
-        if let Some(known) = self.known.get(&key)
-            && known.stamp == stamp
-        {
-            return Ok(known.digest);
-        }
-
-        let digest = Digest::of_reader(&file)?;
-        let unchanged_while_hashing = Stamp::of(&file.metadata()?) == stamp;
-        if unchanged_while_hashing && stamp.is_settled() {
-            self.known.insert(key, Known { stamp, digest });
-            self.dirty = true;
-        }
+        let (digest, learned) = digest_of(path, &self.known)?;
+        self.remember(learned);
         Ok(digest)
+    }
+
+    /// Hashes files on all CPUs, so the `hash_file` calls that follow are lookups.
+    pub fn prefetch(&mut self, paths: &[&Path]) {
+        let mut paths = paths.to_vec();
+        paths.sort_unstable();
+        paths.dedup();
+        let paths = paths.as_slice();
+        let next = AtomicUsize::new(0);
+        let workers = thread::available_parallelism().map_or(1, NonZeroUsize::get).min(paths.len());
+        let known = &self.known;
+        let learned: Vec<(FileKey, Known)> = thread::scope(|scope| {
+            let workers: Vec<_> = (0..workers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut learned = Vec::new();
+                        while let Some(path) = paths.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            learned.extend(digest_of(path, known).ok().and_then(|(_, learned)| learned));
+                        }
+                        learned
+                    })
+                })
+                .collect();
+            workers.into_iter().flat_map(|worker| worker.join().unwrap_or_default()).collect()
+        });
+        for entry in learned {
+            self.remember(Some(entry));
+        }
+    }
+
+    fn remember(&mut self, learned: Option<(FileKey, Known)>) {
+        if let Some((key, known)) = learned {
+            self.dirty |= known.settled;
+            self.known.insert(key, known);
+        }
     }
 
     pub fn save(&mut self) -> io::Result<()> {
@@ -144,7 +187,7 @@ impl ContentHasher {
         }
         let mut bytes = Vec::with_capacity(CACHE_MAGIC.len() + self.known.len() * RECORD_LEN);
         bytes.extend_from_slice(CACHE_MAGIC);
-        for (&(dev, ino), known) in &self.known {
+        for (&(dev, ino), known) in self.known.iter().filter(|(_, known)| known.settled) {
             let Stamp { size, mtime, ctime } = known.stamp;
             for field in [dev, ino, size] {
                 bytes.extend_from_slice(&field.to_le_bytes());
@@ -160,7 +203,44 @@ impl ContentHasher {
     }
 }
 
-fn parse_cache(bytes: &[u8]) -> HashMap<(u64, u64), Known> {
+fn read_up_to(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match reader.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(filled)
+}
+
+/// The digest of a file, and what to remember about it if it had to be hashed.
+fn digest_of(path: &Path, known: &HashMap<FileKey, Known>) -> io::Result<(Digest, Option<(FileKey, Known)>)> {
+    let file = File::open(path)?;
+    let before = file.metadata()?;
+    let key = (before.dev(), before.ino());
+    let stamp = Stamp::of(&before);
+    if let Some(known) = known.get(&key)
+        && known.stamp == stamp
+    {
+        return Ok((known.digest, None));
+    }
+
+    let digest = if git::is_bookkeeping(path) {
+        let mut bytes = Vec::new();
+        (&file).read_to_end(&mut bytes)?;
+        git::digest(path, &bytes).unwrap_or_else(|| Digest::of_bytes(&bytes))
+    } else {
+        Digest::of_file(&file, before.len())?
+    };
+    let unchanged_while_hashing = Stamp::of(&file.metadata()?) == stamp;
+    let learned = unchanged_while_hashing.then(|| (key, Known { stamp, digest, settled: stamp.is_settled() }));
+    Ok((digest, learned))
+}
+
+fn parse_cache(bytes: &[u8]) -> HashMap<FileKey, Known> {
     let Some(records) = bytes.strip_prefix(CACHE_MAGIC) else {
         return HashMap::new();
     };
@@ -173,7 +253,7 @@ fn parse_cache(bytes: &[u8]) -> HashMap<(u64, u64), Known> {
             let signed = |index| i64::from_le_bytes(field(record, index));
             let stamp = Stamp { size: unsigned(2), mtime: (signed(3), signed(4)), ctime: (signed(5), signed(6)) };
             let digest = Digest(record[56..].try_into().unwrap());
-            ((unsigned(0), unsigned(1)), Known { stamp, digest })
+            ((unsigned(0), unsigned(1)), Known { stamp, digest, settled: true })
         })
         .collect()
 }
@@ -196,7 +276,7 @@ mod tests {
         let digest = Digest::of_bytes(b"content");
 
         let mut hasher = ContentHasher::load(Some(cache.clone()));
-        hasher.known.insert((10, 20), Known { stamp, digest });
+        hasher.known.insert((10, 20), Known { stamp, digest, settled: true });
         hasher.dirty = true;
         hasher.save().unwrap();
 
@@ -207,13 +287,39 @@ mod tests {
     }
 
     #[test]
-    fn recently_modified_files_are_not_remembered() {
+    fn recently_modified_files_are_not_saved() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("input");
         fs::write(&file, b"content").unwrap();
 
         let mut hasher = ContentHasher::in_memory();
         assert_eq!(hasher.hash_file(&file).unwrap(), Digest::of_bytes(b"content"));
-        assert!(hasher.known.is_empty());
+        assert!(hasher.known.values().all(|known| !known.settled));
+        assert!(!hasher.dirty);
+    }
+
+    #[test]
+    fn large_files_hash_the_same_in_parallel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large");
+        let content: Vec<u8> = (0..PARALLEL_HASHING_CHUNK as u64 * 2 + 12345).map(|i| (i % 251) as u8).collect();
+        fs::write(&path, &content).unwrap();
+        let file = File::open(&path).unwrap();
+        assert_eq!(Digest::of_file(&file, content.len() as u64).unwrap(), Digest::of_bytes(&content));
+    }
+
+    #[test]
+    fn prefetched_digests_match_hashing_one_file_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<PathBuf> = (0..20).map(|index| dir.path().join(format!("file{index}"))).collect();
+        for (index, path) in paths.iter().enumerate() {
+            fs::write(path, vec![index as u8; index * 1000]).unwrap();
+        }
+        let mut hasher = ContentHasher::in_memory();
+        hasher.prefetch(&paths.iter().map(PathBuf::as_path).collect::<Vec<_>>());
+        assert_eq!(hasher.known.len(), paths.len());
+        for (index, path) in paths.iter().enumerate() {
+            assert_eq!(hasher.hash_file(path).unwrap(), Digest::of_bytes(&vec![index as u8; index * 1000]));
+        }
     }
 }

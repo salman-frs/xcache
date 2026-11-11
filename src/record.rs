@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::digest::ContentHasher;
 use crate::observe::{self, Access, EntryKind, State};
@@ -13,6 +14,9 @@ pub struct Recording {
     pub outputs: BTreeSet<PathBuf>,
     pub preexisting_outputs: BTreeSet<PathBuf>,
     pub output_trees: BTreeSet<PathBuf>,
+    /// Outputs whose modification time the command set to a chosen value last.
+    pub dated_outputs: BTreeSet<PathBuf>,
+    pub started_at: SystemTime,
     pub taints: Vec<String>,
 }
 
@@ -28,12 +32,13 @@ pub enum Effect {
     MakeNode,
     MakeLink,
     Chmod,
+    SetTimes,
     TruncateToZero,
 }
 
 impl Effect {
     fn follows_symlinks(self) -> bool {
-        matches!(self, Effect::Create | Effect::Modify | Effect::Chmod | Effect::TruncateToZero)
+        matches!(self, Effect::Create | Effect::Modify | Effect::Chmod | Effect::SetTimes | Effect::TruncateToZero)
     }
 }
 
@@ -48,7 +53,7 @@ pub struct Mutation {
 enum Recorded {
     Known(State),
     /// A regular file whose content is hashed when the command finishes,
-    /// provided it still has the identity it had when it was read.
+    /// provided it still has the identity it had when it was observed.
     Deferred(Identity),
 }
 
@@ -84,7 +89,7 @@ pub struct Recorder<'h> {
     excluded: Vec<PathBuf>,
     observations: Vec<Observation>,
     seen: HashMap<Access, HashSet<PathBuf>>,
-    deferred_by_path: HashMap<PathBuf, usize>,
+    deferred_by_path: HashMap<PathBuf, Vec<usize>>,
     deferred_by_inode: HashMap<(u64, u64), Vec<usize>>,
     owned_paths: HashSet<PathBuf>,
     owned_inodes: HashSet<(u64, u64)>,
@@ -92,6 +97,8 @@ pub struct Recorder<'h> {
     outputs: BTreeSet<PathBuf>,
     preexisting_outputs: BTreeSet<PathBuf>,
     output_trees: BTreeSet<PathBuf>,
+    dated_outputs: BTreeSet<PathBuf>,
+    started_at: SystemTime,
     created: HashMap<PathBuf, HashSet<OsString>>,
     removed: HashMap<PathBuf, HashMap<OsString, EntryKind>>,
     taints: Vec<String>,
@@ -112,6 +119,8 @@ impl<'h> Recorder<'h> {
             outputs: BTreeSet::new(),
             preexisting_outputs: BTreeSet::new(),
             output_trees: BTreeSet::new(),
+            dated_outputs: BTreeSet::new(),
+            started_at: SystemTime::now(),
             created: HashMap::new(),
             removed: HashMap::new(),
             taints: Vec::new(),
@@ -134,31 +143,34 @@ impl<'h> Recorder<'h> {
     pub fn before_mutation(&mut self, requested: &Path, effect: Effect) -> Option<Mutation> {
         let mut path = real_location(requested);
         if effect.follows_symlinks() && fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_symlink()) {
-            self.observe(Access::Lstat, &path);
+            self.record_observation(Access::Lstat, &path, true);
             path = resolve_symlinks(&path);
         }
         let path = path.as_path();
         if self.is_excluded(path) {
             return None;
         }
-        self.settle_deferred_reads_of(path);
+        self.settle_deferred_observations_of(path);
         let before = fs::symlink_metadata(path).ok().map(|meta| EntryKind::of(meta.file_type()));
 
         if !self.is_owned(path) {
-            match (effect, before) {
+            let access = match (effect, before) {
                 (Effect::RenameFrom, Some(EntryKind::Dir)) => {
                     self.taint(format!("renames a directory it did not create: {}", path.display()));
+                    None
                 }
-                (Effect::RenameFrom, Some(EntryKind::File)) | (Effect::Modify | Effect::Chmod, _) => {
-                    self.record_observation(Access::Read, path, true);
-                }
-                (Effect::Create | Effect::RenameTo, _) => self.observe(Access::Writable, path),
-                (Effect::RemoveDir, _) => self.observe(Access::List, path),
-                (Effect::TruncateToZero, _) => self.observe(Access::Stat, path),
+                (Effect::RenameFrom, Some(EntryKind::File))
+                | (Effect::Modify | Effect::Chmod | Effect::SetTimes, _) => Some(Access::Read),
+                (Effect::Create | Effect::RenameTo, _) => Some(Access::Writable),
+                (Effect::RemoveDir, _) => Some(Access::List),
+                (Effect::TruncateToZero, _) => Some(Access::Stat),
                 (
                     Effect::CreateExclusive | Effect::Remove | Effect::RenameFrom | Effect::MakeNode | Effect::MakeLink,
                     _,
-                ) => self.observe(Access::Lstat, path),
+                ) => Some(Access::Lstat),
+            };
+            if let Some(access) = access {
+                self.record_observation(access, path, true);
             }
         }
 
@@ -171,16 +183,29 @@ impl<'h> Recorder<'h> {
         })
     }
 
+    /// Setting a file's times leaves its content alone but changes the identity
+    /// that deferred hashing checks, so what was observed is hashed first.
+    pub fn before_times_change(&mut self, path: &Path, follows_symlinks: bool) {
+        let path = real_location(path);
+        let path = if follows_symlinks { resolve_symlinks(&path) } else { path };
+        self.settle_deferred_observations_of(&path);
+    }
+
     /// Linking changes the source's ctime, so its content is captured first.
     pub fn before_link(&mut self, source: &Path) {
-        self.settle_deferred_reads_of(&real_location(source));
-        self.observe(Access::Lstat, source);
+        self.settle_deferred_observations_of(&real_location(source));
+        self.record_observation(Access::Lstat, source, true);
         self.record_observation(Access::Read, source, true);
     }
 
     /// Called after the kernel reported that the mutation succeeded.
     pub fn mutated(&mut self, mutation: Mutation) {
         let Mutation { path, effect, parent, name, before } = mutation;
+        if effect == Effect::SetTimes {
+            self.dated_outputs.insert(path.clone());
+        } else {
+            self.dated_outputs.remove(&path);
+        }
         if self.outputs.insert(path.clone()) && before.is_some() {
             self.preexisting_outputs.insert(path.clone());
         }
@@ -193,7 +218,7 @@ impl<'h> Recorder<'h> {
         let meta = if effect == Effect::MakeLink { fs::symlink_metadata(&path) } else { fs::metadata(&path) };
         let is_dir = meta.as_ref().is_ok_and(fs::Metadata::is_dir);
         // A chmod leaves a directory's entries as they were, so they remain inputs.
-        if !(effect == Effect::Chmod && is_dir) {
+        if !(matches!(effect, Effect::Chmod | Effect::SetTimes) && is_dir) {
             if let Ok(meta) = &meta {
                 self.owned_inodes.insert((meta.dev(), meta.ino()));
             }
@@ -210,8 +235,12 @@ impl<'h> Recorder<'h> {
     pub fn renamed(&mut self, from: Mutation, to: Mutation) {
         let moved_directory = from.before == Some(EntryKind::Dir);
         let destination = to.path.clone();
+        let dated = self.dated_outputs.contains(&from.path);
         self.mutated(from);
         self.mutated(to);
+        if dated {
+            self.dated_outputs.insert(destination.clone());
+        }
         if moved_directory {
             self.owned_trees.push(destination.clone());
             self.output_trees.insert(destination);
@@ -220,11 +249,17 @@ impl<'h> Recorder<'h> {
 
     pub fn finish(mut self) -> Recording {
         let observations = std::mem::take(&mut self.observations);
+        let deferred: Vec<&Path> = observations
+            .iter()
+            .filter(|observation| matches!(observation.recorded, Recorded::Deferred(_)))
+            .map(|observation| observation.path.as_path())
+            .collect();
+        self.hasher.prefetch(&deferred);
         let mut inputs = Vec::with_capacity(observations.len());
         for Observation { access, path, recorded } in observations {
             let state = match recorded {
                 Recorded::Known(state) => state,
-                Recorded::Deferred(identity) => self.settle_read(&path, identity),
+                Recorded::Deferred(identity) => self.settle(access, &path, identity),
             };
             if access == Access::Read && matches!(state, State::Special { .. }) {
                 self.taint(format!("reads from a FIFO, socket or device: {}", path.display()));
@@ -236,6 +271,8 @@ impl<'h> Recorder<'h> {
             outputs: self.outputs,
             preexisting_outputs: self.preexisting_outputs,
             output_trees: self.output_trees,
+            dated_outputs: self.dated_outputs,
+            started_at: self.started_at,
             taints: self.taints,
         }
     }
@@ -245,15 +282,30 @@ impl<'h> Recorder<'h> {
             return;
         }
         self.seen.entry(access).or_default().insert(requested.to_path_buf());
+        if access == Access::Listen {
+            let state = observe::probe(access, requested, self.hasher);
+            self.observations.push(Observation {
+                access,
+                path: requested.to_path_buf(),
+                recorded: Recorded::Known(state),
+            });
+            return;
+        }
         let real = real_location(requested);
         if self.is_excluded(&real) || self.is_owned(&real) {
+            return;
+        }
+        if leads_to_machine_state(access, &real) {
+            for link in symlink_chain(&real) {
+                self.record_observation(Access::Lstat, &link, true);
+            }
             return;
         }
         // Paths under /proc name the tracee (cwd, fd links); record where they lead.
         let path = if requested.starts_with("/proc") { real.as_path() } else { requested };
 
         let recorded = match access {
-            Access::Read if !hash_now => match fs::metadata(path) {
+            Access::Read | Access::Stat | Access::Lstat if !hash_now => match metadata(access, path) {
                 Ok(meta) if meta.is_file() => Recorded::Deferred(Identity::of(&meta)),
                 _ => Recorded::Known(observe::probe(access, path, self.hasher)),
             },
@@ -263,7 +315,7 @@ impl<'h> Recorder<'h> {
 
         let index = self.observations.len();
         if let Recorded::Deferred(identity) = &recorded {
-            self.deferred_by_path.insert(path.to_path_buf(), index);
+            self.deferred_by_path.entry(path.to_path_buf()).or_default().push(index);
             self.deferred_by_inode.entry((identity.dev, identity.ino)).or_default().push(index);
         }
         self.observations.push(Observation { access, path: path.to_path_buf(), recorded });
@@ -282,8 +334,8 @@ impl<'h> Recorder<'h> {
         observe::listing_state(dir, &listing)
     }
 
-    fn settle_deferred_reads_of(&mut self, path: &Path) {
-        let mut indexes: Vec<usize> = self.deferred_by_path.get(path).copied().into_iter().collect();
+    fn settle_deferred_observations_of(&mut self, path: &Path) {
+        let mut indexes: Vec<usize> = self.deferred_by_path.get(path).cloned().unwrap_or_default();
         for meta in [fs::metadata(path), fs::symlink_metadata(path)].into_iter().flatten() {
             if let Some(same_inode) = self.deferred_by_inode.get(&(meta.dev(), meta.ino())) {
                 indexes.extend(same_inode);
@@ -291,19 +343,19 @@ impl<'h> Recorder<'h> {
         }
         for index in indexes {
             if let Recorded::Deferred(identity) = self.observations[index].recorded {
-                let path = self.observations[index].path.clone();
-                let state = self.settle_read(&path, identity);
+                let (access, path) = (self.observations[index].access, self.observations[index].path.clone());
+                let state = self.settle(access, &path, identity);
                 self.observations[index].recorded = Recorded::Known(state);
             }
         }
     }
 
-    fn settle_read(&mut self, path: &Path, identity: Identity) -> State {
-        let unchanged = fs::metadata(path).is_ok_and(|meta| Identity::of(&meta) == identity);
+    fn settle(&mut self, access: Access, path: &Path, identity: Identity) -> State {
+        let unchanged = metadata(access, path).is_ok_and(|meta| Identity::of(&meta) == identity);
         if !unchanged {
             self.taint(format!("input changed while the command ran: {}", path.display()));
         }
-        observe::probe(Access::Read, path, self.hasher)
+        observe::probe(access, path, self.hasher)
     }
 
     fn note_created_entry(&mut self, parent: Option<PathBuf>, name: Option<OsString>) {
@@ -323,10 +375,7 @@ impl<'h> Recorder<'h> {
     }
 
     fn is_excluded(&self, real: &Path) -> bool {
-        let machine_state = real.starts_with("/proc")
-            || real.starts_with("/sys")
-            || (real.starts_with("/dev") && !real.starts_with("/dev/shm"));
-        machine_state || self.excluded.iter().any(|excluded| real.starts_with(excluded))
+        is_machine_state(real) || self.excluded.iter().any(|excluded| real.starts_with(excluded))
     }
 
     fn is_owned(&self, real: &Path) -> bool {
@@ -336,12 +385,45 @@ impl<'h> Recorder<'h> {
     }
 }
 
+/// A symlink such as /etc/mtab can lead into /proc, which is machine state.
+fn leads_to_machine_state(access: Access, real: &Path) -> bool {
+    let follows_symlinks = matches!(access, Access::Read | Access::Stat);
+    follows_symlinks
+        && fs::symlink_metadata(real).is_ok_and(|meta| meta.is_symlink())
+        && fs::canonicalize(real).is_ok_and(|target| is_machine_state(&target))
+}
+
+/// The symlinks a path goes through, up to the first target outside them.
+fn symlink_chain(link: &Path) -> Vec<PathBuf> {
+    let mut chain = Vec::new();
+    let mut path = link.to_path_buf();
+    while chain.len() < 40 && !is_machine_state(&path) {
+        let Ok(target) = fs::read_link(&path) else {
+            break;
+        };
+        let next = real_location(&path.parent().unwrap_or(Path::new("/")).join(target));
+        chain.push(path);
+        path = next;
+    }
+    chain
+}
+
+fn is_machine_state(real: &Path) -> bool {
+    real.starts_with("/proc") || real.starts_with("/sys") || (real.starts_with("/dev") && !real.starts_with("/dev/shm"))
+}
+
+fn metadata(access: Access, path: &Path) -> std::io::Result<fs::Metadata> {
+    if access == Access::Lstat { fs::symlink_metadata(path) } else { fs::metadata(path) }
+}
+
 /// Where a path really lives: its parent directory with symlinks and `..`
 /// resolved, so lexical prefixes cannot alias another directory. Magic links
 /// under /proc are followed through to their target.
 fn real_location(path: &Path) -> PathBuf {
-    if path.starts_with("/proc") {
-        return fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if path.starts_with("/proc")
+        && let Ok(real) = fs::canonicalize(path)
+    {
+        return real;
     }
     match (path.parent(), path.file_name()) {
         (Some(parent), Some(name)) => {
@@ -497,10 +579,36 @@ mod tests {
     }
 
     #[test]
+    fn files_created_through_proc_are_owned() {
+        let mut scenario = Scenario::new();
+        let file = scenario.path("created");
+        let dir = fs::File::open(scenario.root()).unwrap();
+        let through_proc =
+            PathBuf::from(format!("/proc/{}/fd/{}/created", std::process::id(), std::os::fd::AsRawFd::as_raw_fd(&dir)));
+        let mut recorder = scenario.recorder();
+        create(&mut recorder, &through_proc, b"x");
+        recorder.observe(Access::Read, &file);
+        assert!(input(&recorder.finish(), Access::Read, &file).is_none());
+    }
+
+    #[test]
     fn system_pseudo_filesystems_are_not_inputs() {
         let mut scenario = Scenario::new();
         let mut recorder = scenario.recorder();
         recorder.observe(Access::Read, Path::new("/proc/self/status"));
         assert!(recorder.finish().inputs.is_empty());
+    }
+
+    #[test]
+    fn links_into_proc_are_recorded_but_not_followed() {
+        let mut scenario = Scenario::new();
+        let mtab = scenario.path("mtab");
+        std::os::unix::fs::symlink("/proc/self/mounts", &mtab).unwrap();
+        let mut recorder = scenario.recorder();
+        recorder.observe(Access::Read, &mtab);
+        let recording = recorder.finish();
+        assert_eq!(recording.inputs.len(), 1);
+        assert_eq!(recording.inputs[0].access, Access::Lstat);
+        assert_eq!(recording.inputs[0].state, State::Symlink { target: "/proc/self/mounts".into() });
     }
 }

@@ -1,8 +1,10 @@
 //! Each test sets a trap for the cache: a change that a naive cache would miss.
 //! Tests need sh, gcc, go and python3 on PATH.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -263,6 +265,85 @@ fn network_access_is_not_cached() {
 }
 
 #[test]
+fn a_socket_path_with_no_service_behind_it_is_an_input() {
+    let ws = Workspace::new();
+    let script = "import socket\ns = socket.socket(socket.AF_UNIX)\ntry: s.connect('service.sock')\nexcept OSError: print('no service')";
+    assert_outcome(&ws.run(&["python3", "-c", script]), "miss");
+    assert_outcome(&ws.run(&["python3", "-c", script]), "hit");
+
+    let _service = std::os::unix::net::UnixListener::bind(ws.path("service.sock")).unwrap();
+    let run = ws.run(&["python3", "-c", script]);
+    assert_outcome(&run, "not_cached");
+    assert!(run.reasons().contains("service.sock"), "{}", run.reasons());
+}
+
+#[test]
+fn a_socket_it_binds_renames_and_connects_to_is_its_own() {
+    let ws = Workspace::new();
+    let script = "import os, socket\nserver = socket.socket(socket.AF_UNIX)\nserver.bind('agent.tmp')\nos.chmod('agent.tmp', 0o600)\nos.rename('agent.tmp', 'agent')\nserver.listen()\nclient = socket.socket(socket.AF_UNIX)\nclient.connect('agent')\nos.unlink('agent')";
+    assert_outcome(&ws.run(&["python3", "-c", script]), "miss");
+    assert_outcome(&ws.run(&["python3", "-c", script]), "hit");
+}
+
+#[test]
+fn many_datagrams_to_its_own_sockets_stay_fast() {
+    let ws = Workspace::new();
+    let script = "import resource, socket\nsoft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)\nresource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))\nsockets = []\nfor _ in range(2500):\n    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n    s.bind(('127.0.0.1', 0 if not sockets else sockets[0].getsockname()[1]))\n    sockets.append(s)\nfor s in sockets:\n    s.sendto(b'x', sockets[0].getsockname())";
+    let started = Instant::now();
+    assert_outcome(&ws.run(&["python3", "-c", script]), "miss");
+    assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
+}
+
+#[test]
+fn an_unused_loopback_port_is_an_input() {
+    let ws = Workspace::new();
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let script = format!(
+        "import socket\nu = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\nu.connect(('127.0.0.1', {udp}))\n\
+         t = socket.socket()\ntry: t.connect(('127.0.0.1', {tcp}))\nexcept OSError: pass"
+    );
+    assert_outcome(&ws.run(&["python3", "-c", &script]), "miss");
+    assert_outcome(&ws.run(&["python3", "-c", &script]), "hit");
+
+    let _service = std::net::UdpSocket::bind(("127.0.0.1", udp)).unwrap();
+    let run = ws.run(&["python3", "-c", &script]);
+    assert_outcome(&run, "not_cached");
+    assert!(run.reasons().contains(&format!("port {udp}")), "{}", run.reasons());
+}
+
+#[test]
+fn a_socket_file_nobody_listens_on_is_not_cached() {
+    let ws = Workspace::new();
+    drop(std::os::unix::net::UnixListener::bind(ws.path("stale.sock")).unwrap());
+    let script = "import socket\ns = socket.socket(socket.AF_UNIX)\ntry: s.connect('stale.sock')\nexcept OSError: pass";
+    assert_outcome(&ws.run(&["python3", "-c", script]), "not_cached");
+}
+
+#[test]
+fn a_link_it_makes_to_another_service_is_not_its_own() {
+    let ws = Workspace::new();
+    let _service = std::os::unix::net::UnixListener::bind(ws.path("service.sock")).unwrap();
+    let script = "import os, socket\nos.symlink('service.sock', 'mine.sock')\ns = socket.socket(socket.AF_UNIX)\ns.connect('mine.sock')";
+    assert_outcome(&ws.run(&["python3", "-c", script]), "not_cached");
+}
+
+#[test]
+fn a_service_on_another_loopback_address_does_not_stand_for_this_one() {
+    let ws = Workspace::new();
+    let elsewhere = std::net::TcpListener::bind("127.0.0.2:0").unwrap();
+    let port = elsewhere.local_addr().unwrap().port();
+    let script = format!(
+        "import socket\ntry: socket.create_connection(('127.0.0.1', {port}))\nexcept OSError: print('refused')"
+    );
+    assert_outcome(&ws.run(&["python3", "-c", &script]), "miss");
+
+    let _here = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let run = ws.run(&["python3", "-c", &script]);
+    assert_outcome(&run, "not_cached");
+}
+
+#[test]
 fn talking_to_its_own_local_server_is_cacheable() {
     let ws = Workspace::new();
     let script = "import socket\nserver = socket.create_server(('127.0.0.1', 0))\nclient = socket.create_connection(server.getsockname())\nprint('connected')";
@@ -294,6 +375,15 @@ fn processes_left_running_are_terminated_and_not_cached() {
     assert_outcome(&run, "not_cached");
     assert!(run.reasons().contains("left processes running"), "{}", run.reasons());
     assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn real_time_signals_reach_the_command() {
+    let ws = Workspace::new();
+    let script = "import os, signal\nsignal.signal(signal.SIGRTMIN, lambda *_: print('handled'))\nos.kill(os.getpid(), signal.SIGRTMIN)";
+    let run = ws.run(&["python3", "-c", script]);
+    assert_eq!(run.stdout, "handled\n", "{}", run.stderr);
+    assert_outcome(&run, "miss");
 }
 
 #[test]
@@ -377,6 +467,96 @@ fn retargeting_a_symlink_misses() {
 }
 
 #[test]
+fn paths_that_are_not_utf8_are_cached_and_restored() {
+    let ws = Workspace::new();
+    let script = "printf data > \"$(printf 'caf\\351')\"";
+    assert_outcome(&ws.sh(script), "miss");
+    let name = OsStr::from_bytes(b"caf\xe9");
+    fs::remove_file(ws.root.join(name)).unwrap();
+    assert_outcome(&ws.sh(script), "hit");
+    assert_eq!(fs::read(ws.root.join(name)).unwrap(), b"data");
+}
+
+#[test]
+fn touching_an_input_is_not_a_change_by_another_process() {
+    let ws = Workspace::new();
+    ws.write("in.txt", "one");
+    let script = "cat in.txt > out.txt && touch -c -d @1000000000 in.txt";
+    assert_outcome(&ws.sh(script), "miss");
+    ws.write("in.txt", "two");
+    assert_outcome(&ws.sh(script), "miss");
+    assert_eq!(ws.read("out.txt"), "two");
+}
+
+#[test]
+fn restored_outputs_are_newer_than_the_checkout_they_are_restored_into() {
+    let ws = Workspace::new();
+    ws.write("main.c", "int v;\n");
+    let build = "cp main.c main.o && sleep 2";
+    let up_to_date = "if [ main.c -nt main.o ]; then echo stale; else echo fresh; fi";
+    assert_outcome(&ws.sh(build), "miss");
+
+    fs::remove_file(ws.path("main.o")).unwrap();
+    ws.write("main.c", "int v;\n");
+    assert_outcome(&ws.sh(build), "hit");
+    assert_eq!(ws.sh(up_to_date).stdout, "fresh\n");
+}
+
+#[test]
+fn replacing_a_link_to_dev_null_misses() {
+    let ws = Workspace::new();
+    symlink("/dev/null", ws.path("settings")).unwrap();
+    assert_outcome(&ws.sh("cat settings > out.txt"), "miss");
+    fs::remove_file(ws.path("settings")).unwrap();
+    ws.write("settings", "verbose");
+    assert_outcome(&ws.sh("cat settings > out.txt"), "miss");
+    assert_eq!(ws.read("out.txt"), "verbose");
+}
+
+#[test]
+fn checking_a_file_it_may_not_read_still_sees_its_size() {
+    use std::os::unix::fs::PermissionsExt;
+    let ws = Workspace::new();
+    let secret = ws.path("secret");
+    let script = "if [ -s secret ]; then echo nonempty; else echo empty; fi > out.txt";
+    fs::write(&secret, "").unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+    assert_outcome(&ws.sh(script), "miss");
+
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(&secret, "x").unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+    assert_outcome(&ws.sh(script), "miss");
+    assert_eq!(ws.read("out.txt"), "nonempty\n");
+}
+
+#[test]
+fn a_modification_time_the_command_chose_is_restored() {
+    let ws = Workspace::new();
+    let script = "touch -d @1000000000 stamp";
+    assert_outcome(&ws.sh(script), "miss");
+    fs::remove_file(ws.path("stamp")).unwrap();
+    assert_outcome(&ws.sh(script), "hit");
+    let modified = fs::metadata(ws.path("stamp")).unwrap().modified().unwrap();
+    assert_eq!(modified, std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000));
+}
+
+#[test]
+fn a_time_chosen_within_the_run_is_restored_relative_to_it() {
+    let ws = Workspace::new();
+    ws.write("main.c", "int v;\n");
+    let build = "start=$(date +%s.%N); sleep 1; cp main.c main.o; touch -d @$start main.o.d";
+    let up_to_date = "if [ main.c -nt main.o.d ]; then echo stale; else echo fresh; fi";
+    assert_outcome(&ws.sh(build), "miss");
+
+    fs::remove_file(ws.path("main.o")).unwrap();
+    fs::remove_file(ws.path("main.o.d")).unwrap();
+    ws.write("main.c", "int v;\n");
+    assert_outcome(&ws.sh(build), "hit");
+    assert_eq!(ws.sh(up_to_date).stdout, "fresh\n");
+}
+
+#[test]
 fn deletions_are_replayed() {
     let ws = Workspace::new();
     ws.write("stale.txt", "old");
@@ -423,6 +603,190 @@ fn shadow_mode_confirms_hits_and_catches_nondeterminism() {
         c.arg("--shadow");
     });
     assert_eq!(caught.report["shadow"], "nondeterministic", "{}", caught.report);
+}
+
+#[test]
+fn a_same_size_edit_behind_a_modification_time_check_misses() {
+    let ws = Workspace::new();
+    ws.write("main.c", "int v = 1;\n");
+    ws.write("main.o", "int v = 1;\n");
+    let set_age = |name: &str, seconds_ago: u64| {
+        let file = fs::File::options().write(true).open(ws.path(name)).unwrap();
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(seconds_ago)).unwrap();
+    };
+    set_age("main.c", 200);
+    set_age("main.o", 100);
+    let make = "if [ main.c -nt main.o ]; then cp main.c main.o; fi";
+    assert_outcome(&ws.sh(make), "miss");
+    assert_outcome(&ws.sh(make), "hit");
+
+    ws.write("main.c", "int v = 2;\n");
+    assert_outcome(&ws.sh(make), "miss");
+    assert_eq!(ws.read("main.o"), "int v = 2;\n");
+}
+
+#[test]
+fn fresh_clones_of_the_same_commit_hit_although_git_bookkeeping_differs() {
+    let ws = Workspace::new();
+    let git_as = |user: &str, dir: &str, args: &[&str]| {
+        let status = Command::new("git")
+            .args(["-c", &format!("user.name={user}"), "-c", "user.email=t@t", "-c", "init.defaultBranch=main"])
+            .args(args)
+            .current_dir(ws.path(dir))
+            .output()
+            .unwrap()
+            .status;
+        assert!(status.success(), "git {args:?}");
+    };
+    let git = |dir: &str, args: &[&str]| git_as("t", dir, args);
+    ws.write("origin/a.txt", "a");
+    git("origin", &["init", "-q"]);
+    git("origin", &["add", "a.txt"]);
+    git("origin", &["commit", "-q", "-m", "a"]);
+    let fresh_clone = |user: &str| {
+        let _ = fs::remove_dir_all(ws.path("src"));
+        git_as(user, ".", &["clone", "-q", "--no-local", "origin", "src"]);
+        git_as(user, "src", &["checkout", "-q", "--detach"]);
+    };
+    let status = || {
+        ws.run_with(&["git", "status"], |c| {
+            c.current_dir(ws.path("src"));
+        })
+    };
+
+    fresh_clone("runner");
+    assert_outcome(&status(), "miss");
+    std::thread::sleep(Duration::from_secs(1));
+    fresh_clone("another runner");
+    let again = status();
+    assert_outcome(&again, "hit");
+    assert!(again.stdout.contains("HEAD detached"), "{}", again.stdout);
+
+    ws.write("src/a.txt", "b");
+    git("src", &["add", "a.txt"]);
+    let staged_change = status();
+    assert_outcome(&staged_change, "miss");
+    assert!(staged_change.stdout.contains("modified:   a.txt"), "{}", staged_change.stdout);
+}
+
+#[test]
+fn shadow_mode_leaves_what_a_hit_would_so_later_commands_see_the_same_files() {
+    let ws = Workspace::new();
+    let stamp = ["sh", "-c", "date +%s%N > stamp.txt"];
+    let copy = ["sh", "-c", "cat stamp.txt > copy.txt"];
+    assert_outcome(&ws.run(&stamp), "miss");
+    assert_outcome(&ws.run(&copy), "miss");
+    let cached_stamp = ws.read("stamp.txt");
+
+    let shadowed = ws.run_with(&stamp, |c| {
+        c.arg("--shadow");
+    });
+    assert_eq!(shadowed.report["shadow"], "nondeterministic", "{}", shadowed.report);
+    assert_eq!(ws.read("stamp.txt"), cached_stamp);
+
+    let downstream = ws.run_with(&copy, |c| {
+        c.arg("--shadow");
+    });
+    assert_eq!(downstream.report["shadow"], "correct", "{}", downstream.report);
+}
+
+#[test]
+fn shadow_mode_removes_files_only_the_fresh_run_created() {
+    let ws = Workspace::new();
+    let script = "mkdir -p out && touch out/$(date +%s%N)";
+    assert_outcome(&ws.sh(script), "miss");
+    let cached: Vec<_> = fs::read_dir(ws.path("out")).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+    fs::remove_dir_all(ws.path("out")).unwrap();
+
+    let shadowed = ws.run_with(&["sh", "-c", script], |c| {
+        c.arg("--shadow");
+    });
+    assert_eq!(shadowed.report["shadow"], "nondeterministic", "{}", shadowed.report);
+    let left: Vec<_> = fs::read_dir(ws.path("out")).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+    assert_eq!(left, cached);
+}
+
+#[test]
+fn reading_a_file_the_cached_run_wrote_is_not_a_false_hit() {
+    let ws = Workspace::new();
+    ws.write("config.in", "v1");
+    ws.write("config.out", "v1");
+    let set_age = |name: &str, seconds_ago: u64| {
+        let file = fs::File::options().write(true).open(ws.path(name)).unwrap();
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(seconds_ago)).unwrap();
+    };
+    set_age("config.out", 200);
+    set_age("config.in", 100);
+    let build =
+        "if [ config.in -nt config.out ]; then rm config.out; cp config.in config.out; fi; cat config.out > result";
+    assert_outcome(&ws.sh(build), "miss");
+
+    set_age("config.in", 300);
+    let shadowed = ws.run_with(&["sh", "-c", build], |c| {
+        c.arg("--shadow");
+    });
+    assert_eq!(shadowed.report["shadow"], "nondeterministic", "{}", shadowed.report);
+}
+
+#[test]
+fn reading_what_the_cached_run_only_checked_is_not_a_false_hit() {
+    let ws = Workspace::new();
+    ws.write("data.txt", "same");
+    ws.write("marker", "");
+    let set_age = |name: &str, seconds_ago: u64| {
+        let file = fs::File::options().write(true).open(ws.path(name)).unwrap();
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(seconds_ago)).unwrap();
+    };
+    set_age("data.txt", 200);
+    set_age("marker", 100);
+    let build = "if [ data.txt -nt marker ]; then read line < data.txt; test -e data.txt/sub; \
+                 else test -s data.txt; fi; date +%s%N > built";
+    assert_outcome(&ws.sh(build), "miss");
+
+    set_age("data.txt", 50);
+    let shadowed = ws.run_with(&["sh", "-c", build], |c| {
+        c.arg("--shadow");
+    });
+    assert_eq!(shadowed.report["shadow"], "nondeterministic", "{}", shadowed.report);
+}
+
+#[test]
+fn reading_a_file_the_cached_run_overwrote_unseen_is_not_a_false_hit() {
+    let ws = Workspace::new();
+    ws.write("src.txt", "");
+    ws.write("marker", "");
+    ws.write("fingerprint", "old");
+    let set_age = |name: &str, seconds_ago: u64| {
+        let file = fs::File::options().write(true).open(ws.path(name)).unwrap();
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(seconds_ago)).unwrap();
+    };
+    set_age("marker", 200);
+    set_age("src.txt", 100);
+    let build = "if [ src.txt -nt marker ]; then echo new > fingerprint; else read seen < fingerprint; fi; \
+                 date +%s%N > stamp";
+    assert_outcome(&ws.sh(build), "miss");
+
+    ws.write("fingerprint", "old");
+    set_age("src.txt", 300);
+    let shadowed = ws.run_with(&["sh", "-c", build], |c| {
+        c.arg("--shadow");
+    });
+    assert_eq!(shadowed.report["shadow"], "nondeterministic", "{}", shadowed.report);
+}
+
+#[test]
+fn a_fresh_failure_with_the_same_inputs_is_nondeterministic_not_a_false_hit() {
+    let ws = Workspace::new();
+    let counter = ws.store.path().join("runs");
+    fs::write(&counter, "0").unwrap();
+    let flaky = format!("n=$(cat {0}); echo $((n + 1)) > {0}; test $n -eq 0", counter.display());
+    assert_outcome(&ws.sh(&flaky), "miss");
+
+    let shadowed = ws.run_with(&["sh", "-c", &flaky], |c| {
+        c.arg("--shadow");
+    });
+    assert_eq!(shadowed.report["shadow"], "nondeterministic", "{}", shadowed.report);
+    assert_eq!(shadowed.status, 0);
 }
 
 #[test]

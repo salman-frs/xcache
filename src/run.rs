@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::process::ExitStatusExt;
@@ -72,6 +72,8 @@ enum ShadowVerdict {
 struct Execution {
     exit_code: i32,
     inputs: Vec<Input>,
+    /// Paths that did not exist before the run and were written by it.
+    created: BTreeSet<PathBuf>,
     result: Option<RunResult>,
     reasons: Vec<String>,
     traced: bool,
@@ -102,7 +104,7 @@ pub fn run(options: RunOptions) -> Result<i32> {
         say(format!("ignoring unreadable cache entries ({error})"));
         Vec::new()
     });
-    let hit = entries.iter().find(|entry| first_mismatch(entry, &mut hasher).is_none());
+    let mut hit = entries.iter().find(|entry| first_mismatch(entry, &mut hasher).is_none());
     report.timings_ms.lookup = started.elapsed().as_millis() as u64;
 
     if let Some(entry) = hit
@@ -125,7 +127,10 @@ pub fn run(options: RunOptions) -> Result<i32> {
                 write_report(&options.report, &report)?;
                 return Ok(entry.result.exit_code);
             }
-            Err(error) => say(format!("could not restore the cached result ({error:#}); running the command")),
+            Err(error) => {
+                say(format!("could not restore the cached result ({error:#}); running the command"));
+                hit = None;
+            }
         }
     }
 
@@ -143,9 +148,7 @@ pub fn run(options: RunOptions) -> Result<i32> {
         (None, true) => ReportOutcome::NotCached,
     };
 
-    if options.shadow
-        && let Some(cached) = hit
-    {
+    if let Some(cached) = hit {
         let (verdict, differences) = shadow_verdict(cached, &execution);
         report.shadow = Some(verdict);
         report.differences = differences;
@@ -156,7 +159,23 @@ pub fn run(options: RunOptions) -> Result<i32> {
                 "shadow: the command read the same inputs but produced a different result, so it is nondeterministic: {details}"
             )),
             ShadowVerdict::FalseHit => {
-                eprintln!("xcache: shadow: FALSE HIT, the cached result differs from a fresh run: {details}")
+                eprintln!("xcache: shadow: FALSE HIT, the cached result differs from a fresh run: {details}");
+                if let Err(error) = store.remove(fingerprint, cached) {
+                    say(format!("could not remove the wrong cache entry ({error})"));
+                }
+            }
+        }
+        if verdict != ShadowVerdict::FalseHit {
+            match leave_cached_result(verdict, cached, &execution, &store) {
+                Ok(()) => {
+                    let _ = store.mark_used(fingerprint, cached.created_at);
+                    let _ = hasher.save();
+                    report.exit_code = cached.result.exit_code;
+                    report.duration_ms = duration.as_millis() as u64;
+                    write_report(&options.report, &report)?;
+                    return Ok(cached.result.exit_code);
+                }
+                Err(error) => say(format!("could not restore the cached result ({error:#}); keeping the fresh one")),
             }
         }
     }
@@ -220,6 +239,7 @@ fn execute(invocation: &Invocation, store: &Store, hasher: &mut ContentHasher) -
             Ok(Execution {
                 exit_code,
                 inputs: Vec::new(),
+                created: BTreeSet::new(),
                 result: None,
                 reasons: vec![reason],
                 traced: false,
@@ -234,6 +254,7 @@ fn execute(invocation: &Invocation, store: &Store, hasher: &mut ContentHasher) -
             Ok(Execution {
                 exit_code,
                 inputs: Vec::new(),
+                created: BTreeSet::new(),
                 result: None,
                 reasons: vec![error.to_string()],
                 traced: true,
@@ -263,9 +284,11 @@ fn execute(invocation: &Invocation, store: &Store, hasher: &mut ContentHasher) -
                 hashing: traced.hashing_time.as_millis() as u64,
                 store: storing.elapsed().as_millis() as u64,
             };
+            let created = traced.recording.outputs.difference(&traced.recording.preexisting_outputs).cloned().collect();
             Ok(Execution {
                 exit_code: traced.exit.code(),
                 inputs: traced.recording.inputs,
+                created,
                 result,
                 reasons,
                 traced: true,
@@ -293,23 +316,49 @@ fn run_untraced(invocation: &Invocation) -> Result<i32> {
     Ok(status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)))
 }
 
+/// Checks what costs no hashing first, then hashes the remaining files in parallel.
 fn first_mismatch<'e>(entry: &'e Entry, hasher: &mut ContentHasher) -> Option<(&'e Input, State)> {
-    entry.inputs.iter().find_map(|input| {
+    let mismatch = |input: &'e Input, hasher: &mut ContentHasher| {
         let current = observe::probe(input.access, &input.path, hasher);
         (current != input.state).then_some((input, current))
-    })
+    };
+    let (files, others): (Vec<&Input>, Vec<&Input>) =
+        entry.inputs.iter().partition(|input| matches!(input.state, State::File { .. }));
+    if let Some(found) = others.into_iter().find_map(|input| mismatch(input, hasher)) {
+        return Some(found);
+    }
+    let metadata_changed = files
+        .iter()
+        .filter(|input| !observe::file_metadata_matches(input.access, &input.path, &input.state))
+        .find_map(|input| mismatch(input, hasher));
+    if metadata_changed.is_some() {
+        return metadata_changed;
+    }
+    hasher.prefetch(&files.iter().map(|input| input.path.as_path()).collect::<Vec<_>>());
+    files.into_iter().find_map(|input| mismatch(input, hasher))
+}
+
+/// Leaves what a hit would have left, so the commands that follow see the same
+/// files with and without --shadow.
+fn leave_cached_result(verdict: ShadowVerdict, cached: &Entry, fresh: &Execution, store: &Store) -> Result<()> {
+    if verdict != ShadowVerdict::Nondeterministic {
+        return Ok(());
+    }
+    outputs::restore(&cached.result.outputs, store)?;
+    let cached_paths: HashSet<&Path> = cached.result.outputs.iter().map(|output| output.path.as_path()).collect();
+    let created_only_by_fresh_run = fresh.created.iter().filter(|path| !cached_paths.contains(path.as_path()));
+    outputs::remove_created(created_only_by_fresh_run.rev())
 }
 
 fn shadow_verdict(cached: &Entry, execution: &Execution) -> (ShadowVerdict, Vec<String>) {
-    let Some(fresh) = &execution.result else {
-        let reasons = execution.reasons.iter().map(|reason| format!("fresh run is not cacheable: {reason}")).collect();
-        return (ShadowVerdict::FalseHit, reasons);
+    let differences = match &execution.result {
+        Some(fresh) => differences(&cached.result, fresh),
+        None => execution.reasons.iter().map(|reason| format!("fresh run is not cacheable: {reason}")).collect(),
     };
-    let differences = differences(&cached.result, fresh);
     if differences.is_empty() {
         return (ShadowVerdict::Correct, differences);
     }
-    let unrecorded = unrecorded_inputs(&cached.inputs, &execution.inputs);
+    let unrecorded = unrecorded_inputs(cached, &execution.inputs);
     if unrecorded.is_empty() {
         (ShadowVerdict::Nondeterministic, differences)
     } else {
@@ -317,16 +366,39 @@ fn shadow_verdict(cached: &Entry, execution: &Execution) -> (ShadowVerdict, Vec<
     }
 }
 
-/// Inputs the fresh run depended on that the cached run did not record.
-/// Probes of paths that did not exist are left out: tools pick random names for
-/// temporary files, so each run probes different absent paths.
-fn unrecorded_inputs(cached: &[Input], fresh: &[Input]) -> Vec<String> {
+/// Inputs the fresh run depended on that the cached run did not record, leaving
+/// out absent paths, which differ for random temporary names, and files the
+/// cached run recorded with that content or overwrote without looking.
+fn unrecorded_inputs(cached: &Entry, fresh: &[Input]) -> Vec<String> {
     let recorded: HashMap<(Access, &Path), &State> =
-        cached.iter().map(|input| ((input.access, input.path.as_path()), &input.state)).collect();
+        cached.inputs.iter().map(|input| ((input.access, input.path.as_path()), &input.state)).collect();
+    let mut recorded_files: HashMap<&Path, Vec<&State>> = HashMap::new();
+    for input in cached.inputs.iter().filter(|input| matches!(input.state, State::File { .. })) {
+        recorded_files.entry(input.path.as_path()).or_default().push(&input.state);
+    }
+    let written: HashSet<&Path> = cached.result.outputs.iter().map(|output| output.path.as_path()).collect();
+
+    let absent = |input: &Input| {
+        matches!(
+            input.state,
+            State::Missing | State::Error { errno: libc::ENOTDIR } | State::Writable { is_dir: false, .. }
+        )
+    };
+    let recorded_as_is = |input: &Input| {
+        recorded.get(&(input.access, input.path.as_path())) == Some(&&input.state)
+            || recorded_files.get(input.path.as_path()).is_some_and(|states| states.contains(&&input.state))
+    };
+    let looked_at: HashSet<&Path> = cached
+        .inputs
+        .iter()
+        .filter(|input| input.access != Access::Writable && input.state != State::Missing)
+        .map(|input| input.path.as_path())
+        .collect();
+    let written_blindly =
+        |input: &Input| written.contains(input.path.as_path()) && !looked_at.contains(input.path.as_path());
     fresh
         .iter()
-        .filter(|input| !matches!(input.state, State::Missing | State::Writable { is_dir: false, .. }))
-        .filter(|input| recorded.get(&(input.access, input.path.as_path())) != Some(&&input.state))
+        .filter(|input| !absent(input) && !recorded_as_is(input) && !written_blindly(input))
         .map(|input| {
             format!("{} ({:?}) was not recorded as {}", input.path.display(), input.access, describe(&input.state))
         })
@@ -363,7 +435,7 @@ fn describe(state: &State) -> String {
         State::File { size, mode, content: Some(content) } => {
             format!("{size}-byte file {} with mode {mode:o}", &content.to_hex()[..12])
         }
-        State::File { size, mode, content: None } => format!("{size}-byte file with mode {mode:o}"),
+        State::File { size, mode, content: None } => format!("unreadable {size}-byte file with mode {mode:o}"),
         State::Dir { real_path, mode } => format!("directory {} with mode {mode:o}", real_path.display()),
         State::Listing { entries, .. } => format!("listing {}", &entries.to_hex()[..12]),
         State::Symlink { target } => format!("symlink to {}", target.display()),

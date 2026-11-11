@@ -1,0 +1,270 @@
+# Projects that corpus.py measures. Each project is checked out at `rev` and at
+# the `commits` first-parent commits before it.
+#
+# `setup` runs before the steps in every phase, without xcache, the way a CI job
+# installs dependencies. `prime` runs once, after the first setup, to fill the
+# dependency caches in $HOME that every phase then starts from.
+# `steps` are the commands measured under xcache. They are split like a shell
+# would split them but not run by a shell.
+
+commits = 6
+
+[ecosystem.go]
+setup = ["go mod download"]
+env = { GOFLAGS = "-modcacherw", GOTOOLCHAIN = "local" }
+
+[ecosystem.rust]
+setup = ["cargo fetch"]
+env = { CARGO_INCREMENTAL = "0", CARGO_TERM_COLOR = "never" }
+
+[ecosystem.node]
+setup = ["npm ci"]
+env = { NODE_DISABLE_COMPILE_CACHE = "1", npm_config_audit = "false", npm_config_fund = "false", npm_config_logs_max = "0", npm_config_update_notifier = "false" }
+
+[ecosystem.python]
+setup = ["uv sync --locked"]
+env = { UV_NO_PROGRESS = "1" }
+
+# Gradle and Kotlin daemons outlive the command, so every step runs without them.
+[ecosystem.gradle]
+env = {}
+
+[ecosystem.cmake]
+env = { CMAKE_BUILD_PARALLEL_LEVEL = "4", CTEST_PARALLEL_LEVEL = "4" }
+
+# Go
+
+[[project]]
+name = "uuid"
+repo = "google/uuid"
+rev = "2d3c2a9cc518326daf99a383f07c4d3c44317e4d"
+ecosystem = "go"
+steps = ["go vet ./...", "go build ./...", "go test ./..."]
+
+[[project]]
+name = "cobra"
+repo = "spf13/cobra"
+rev = "adbc8813901bba65827259daa8e22ff94ec1f30e"
+ecosystem = "go"
+steps = ["go vet ./...", "go build ./...", "go test ./..."]
+
+[[project]]
+name = "chi"
+repo = "go-chi/chi"
+rev = "c64ed7d6635f33a8b2feaff7dcfa55677023ac7d"
+ecosystem = "go"
+steps = ["go vet ./...", "go build ./...", "go test ./..."]
+
+[[project]]
+name = "testify"
+repo = "stretchr/testify"
+rev = "87a7b9d57689f6579db2da795ab8deeab29cb724"
+ecosystem = "go"
+steps = ["go vet ./...", "go build ./...", "go test ./..."]
+
+[[project]]
+name = "toml"
+repo = "BurntSushi/toml"
+rev = "d733fc535e4a9f3c454e421a87b90ade5d49bf31"
+ecosystem = "go"
+steps = ["go vet ./...", "go build ./...", "go test ./..."]
+
+# Rust
+
+[[project]]
+name = "ripgrep"
+repo = "BurntSushi/ripgrep"
+rev = "178cc027e283fd965cb72d0a7395b219eada170c"
+ecosystem = "rust"
+steps = ["cargo build --locked", "cargo test --locked"]
+
+[[project]]
+name = "fd"
+repo = "sharkdp/fd"
+rev = "24d90b28d25438af2a8f2e7f7e46d03d6828da94"
+ecosystem = "rust"
+steps = ["cargo build --locked", "cargo test --locked"]
+
+[[project]]
+name = "serde_json"
+repo = "serde-rs/json"
+rev = "8c535a260ce561eaab4111aafc29038eb9f77ff3"
+ecosystem = "rust"
+steps = ["cargo build", "cargo test"]
+
+[[project]]
+name = "anyhow"
+repo = "dtolnay/anyhow"
+rev = "87c8571326d60b90391d0555c9675b5ac6f044b1"
+ecosystem = "rust"
+steps = ["cargo build", "cargo test"]
+
+[[project]]
+name = "just"
+repo = "casey/just"
+rev = "7b7b51bec9359a5b4a76321018db65d07978fecc"
+ecosystem = "rust"
+steps = ["cargo build --locked", "cargo test --locked"]
+
+# Node
+
+[[project]]
+name = "luxon"
+repo = "moment/luxon"
+rev = "f427515a38f6a671f8de663e6bcc040ed81f114e"
+ecosystem = "node"
+env = { LANG = "en_US.utf8", TZ = "America/New_York" }
+steps = ["npm run build", "npm test"]
+
+[[project]]
+name = "koa"
+repo = "koajs/koa"
+rev = "b7ead6f7a2bb56e2948b1c5e1cca77483e89c885"
+ecosystem = "node"
+steps = ["npm run lint", "npm test"]
+
+[[project]]
+name = "commander"
+repo = "tj/commander.js"
+rev = "a5a7dc084d4d2b7932e85ca049c5204e50a2c721"
+ecosystem = "node"
+steps = ["npm run check:type", "npm run check:lint", "npm test"]
+
+[[project]]
+name = "marked"
+repo = "markedjs/marked"
+rev = "afba4543ff47620ad60e980bc2f091971ccfdd8c"
+ecosystem = "node"
+steps = ["npm run build", "npm run test:specs", "npm run test:unit", "npm run test:lint"]
+
+[[project]]
+name = "uuidjs"
+repo = "uuidjs/uuid"
+rev = "766d0d29c1646f37cb2261bbee723f0daf94e44a"
+ecosystem = "node"
+steps = ["npm run build", "npm test", "npm run lint"]
+
+[[project]]
+name = "chalk"
+repo = "chalk/chalk"
+rev = "72110019e147683f60e13fa0ff5c14a0c27cd9fe"
+ecosystem = "node"
+setup = ["npm install"]
+steps = ["npm test"]
+
+# Python
+
+[[project]]
+name = "click"
+repo = "pallets/click"
+rev = "8abb77a8432e03ed14a95f972b44f905279415a7"
+ecosystem = "python"
+setup = ["uv sync --locked --group tests"]
+prime = ["uv build --wheel"]
+steps = ["uv build --wheel --offline", ".venv/bin/ruff check", ".venv/bin/pytest"]
+
+[[project]]
+name = "flask"
+repo = "pallets/flask"
+rev = "49943b5a94413a530761350f04e896f76e8d620e"
+ecosystem = "python"
+setup = ["uv sync --locked --group tests"]
+steps = [".venv/bin/ruff check", ".venv/bin/pytest"]
+
+[[project]]
+name = "markupsafe"
+repo = "pallets/markupsafe"
+rev = "4e111271b1494995708a9e878a10829b5e10c7ba"
+ecosystem = "python"
+setup = ["uv sync --locked --group tests"]
+prime = ["uv build --wheel"]
+steps = ["uv build --wheel --offline", ".venv/bin/pytest"]
+
+[[project]]
+name = "jinja"
+repo = "pallets/jinja"
+rev = "5ef70112a1ff19c05324ff889dd30405b1002044"
+ecosystem = "python"
+setup = ["uv sync --locked --group tests"]
+steps = [".venv/bin/ruff check", ".venv/bin/pytest"]
+
+[[project]]
+name = "more-itertools"
+repo = "more-itertools/more-itertools"
+rev = "ceafee8ce96f4bc1eb74c528bc247c91d648a0bb"
+ecosystem = "python"
+setup = ["uv venv --allow-existing", "uv pip install -e . -r requirements/testing.txt"]
+steps = [".venv/bin/python -m unittest"]
+
+# Java with Gradle
+
+[[project]]
+name = "spring-petclinic"
+repo = "spring-projects/spring-petclinic"
+rev = "500158f732419217507c7656904b8e6aa1bcc0d6"
+ecosystem = "gradle"
+prime = ["./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process assemble check"]
+steps = ["./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process assemble", "./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process check"]
+
+[[project]]
+name = "kotlinpoet"
+repo = "square/kotlinpoet"
+rev = "66105b28628a471d3ade229f9c30e676392384b6"
+ecosystem = "gradle"
+prime = ["./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process assemble :kotlinpoet:testJdk21"]
+steps = ["./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process assemble", "./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process :kotlinpoet:testJdk21"]
+
+[[project]]
+name = "mockito"
+repo = "mockito/mockito"
+rev = "10b31ba2a8252cf340bc154c9e05224802a84691"
+ecosystem = "gradle"
+prime = ["./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process assemble :mockito-core:test"]
+steps = ["./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process assemble", "./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process :mockito-core:test"]
+
+# C and C++ with CMake
+
+[[project]]
+name = "zlib"
+repo = "madler/zlib"
+rev = "99623ef7097352da7993ba614161fd6a311e046e"
+ecosystem = "cmake"
+steps = ["cmake -S . -B build", "cmake --build build", "ctest --test-dir build --output-on-failure"]
+
+[[project]]
+name = "fmt"
+repo = "fmtlib/fmt"
+rev = "e7e6e3f71033fbfc71eba1709789328bcb0ceb28"
+ecosystem = "cmake"
+steps = ["cmake -S . -B build", "cmake --build build", "ctest --test-dir build --output-on-failure"]
+
+[[project]]
+name = "libuv"
+repo = "libuv/libuv"
+rev = "ac325226bd37e9ca978694dd01b7cf600f05a339"
+ecosystem = "cmake"
+# Both test binaries use port 9123, so running them in parallel fails without xcache.
+env = { CTEST_PARALLEL_LEVEL = "1" }
+steps = [
+  "cmake -S . -B build -DLIBUV_BUILD_TESTS=ON",
+  "cmake --build build",
+  "ctest --test-dir build --output-on-failure",
+]
+
+[[project]]
+name = "json-c"
+repo = "json-c/json-c"
+rev = "0389cc85ce058073430938f8f4824986caa4d663"
+ecosystem = "cmake"
+steps = ["cmake -S . -B build", "cmake --build build", "ctest --test-dir build --output-on-failure"]
+
+[[project]]
+name = "googletest"
+repo = "google/googletest"
+rev = "adaffb94a924d9011cf9f19f9d4d5ee23e207a7c"
+ecosystem = "cmake"
+steps = [
+  "cmake -S . -B build -Dgtest_build_tests=ON",
+  "cmake --build build",
+  "ctest --test-dir build --output-on-failure",
+]

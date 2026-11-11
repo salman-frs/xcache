@@ -1,8 +1,11 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::ffi::CString;
 use std::fs::{self, File};
 use std::io;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
@@ -16,12 +19,23 @@ pub fn capture(recording: &Recording, store: &Store) -> Result<Vec<Output>> {
         collect_tree(tree, &mut paths).with_context(|| format!("walking {}", tree.display()))?;
     }
 
+    let end_of_run = SystemTime::now();
+    let mut first_name_of_inode: HashMap<(u64, u64), PathBuf> = HashMap::new();
     let mut outputs = Vec::with_capacity(paths.len());
     for path in paths {
-        if path.to_str().is_none() {
-            bail!("writes a path that is not valid UTF-8: {}", path.display());
-        }
-        let state = match fs::symlink_metadata(&path) {
+        let meta = fs::symlink_metadata(&path);
+        let age_ns = meta
+            .as_ref()
+            .ok()
+            .and_then(|meta| end_of_run.duration_since(meta.modified().ok()?).ok())
+            .map_or(0, |age| age.as_nanos() as u64);
+        let chosen_mtime_ns = match &meta {
+            Ok(meta) if recording.dated_outputs.contains(&path) && !during(recording.started_at, end_of_run, meta) => {
+                Some(meta.mtime() * 1_000_000_000 + meta.mtime_nsec())
+            }
+            _ => None,
+        };
+        let state = match meta {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 if !recording.preexisting_outputs.contains(&path) {
                     continue;
@@ -31,20 +45,36 @@ pub fn capture(recording: &Recording, store: &Store) -> Result<Vec<Output>> {
             Err(error) => return Err(error).with_context(|| format!("inspecting output {}", path.display())),
             Ok(meta) if meta.is_symlink() => OutputState::Symlink { target: fs::read_link(&path)? },
             Ok(meta) if meta.is_dir() => OutputState::Dir { mode: observe::permission_bits(&meta) },
+            Ok(meta)
+                if meta.is_file()
+                    && meta.nlink() > 1
+                    && first_name_of_inode.contains_key(&(meta.dev(), meta.ino())) =>
+            {
+                OutputState::HardLink { target: first_name_of_inode[&(meta.dev(), meta.ino())].clone() }
+            }
             Ok(meta) if meta.is_file() => {
+                if meta.nlink() > 1 {
+                    first_name_of_inode.insert((meta.dev(), meta.ino()), path.clone());
+                }
                 let (content, size) =
                     store.put_file(&path).with_context(|| format!("storing output {}", path.display()))?;
                 OutputState::File { mode: observe::permission_bits(&meta), size, content }
             }
-            Ok(_) => bail!("creates a FIFO, socket or device: {}", path.display()),
+            Ok(meta) if meta.file_type().is_socket() => continue,
+            Ok(_) => bail!("creates a FIFO or device: {}", path.display()),
         };
-        outputs.push(Output { path, state });
+        outputs.push(Output { path, state, age_ns, chosen_mtime_ns });
     }
     Ok(outputs)
 }
 
+/// Restored outputs are dated a step apart, in their original order, just before
+/// the restore, so make and cargo see them as newer than the work tree.
+const MODIFICATION_STEP: Duration = Duration::from_micros(1);
+
 /// Relies on outputs being sorted by path, so parents come before their children.
 pub fn restore(outputs: &[Output], store: &Store) -> Result<()> {
+    let restored_at = SystemTime::now();
     for output in outputs.iter().rev() {
         if output.state == OutputState::Deleted {
             remove(&output.path).with_context(|| format!("deleting {}", output.path.display()))?;
@@ -62,10 +92,70 @@ pub fn restore(outputs: &[Output], store: &Store) -> Result<()> {
                 write_file(path, *mode, |file| store.copy_blob_to(*content, file))
                     .with_context(|| format!("restoring {}", path.display()))?;
             }
+            OutputState::HardLink { target } => {
+                remove(path)?;
+                fs::hard_link(target, path).with_context(|| format!("linking {}", path.display()))?;
+            }
             OutputState::Symlink { target } => {
                 remove(path)?;
                 symlink(target, path).with_context(|| format!("linking {}", path.display()))?;
             }
+        }
+    }
+    let restored: Vec<&Output> = outputs.iter().rev().filter(|output| output.state != OutputState::Deleted).collect();
+    let mut ages: Vec<u64> = restored.iter().map(|output| output.age_ns).collect();
+    ages.sort_unstable_by(|a, b| b.cmp(a));
+    ages.dedup();
+    for output in restored {
+        let newer_ages = ages.partition_point(|&age| age > output.age_ns);
+        let modified = match output.chosen_mtime_ns {
+            Some(nanoseconds) => since_epoch(nanoseconds),
+            None => restored_at - MODIFICATION_STEP * (ages.len() - newer_ages) as u32,
+        };
+        set_modified(&output.path, modified).with_context(|| format!("dating {}", output.path.display()))?;
+    }
+    Ok(())
+}
+
+/// A time chosen within the run, like cargo's dep-info dates, is restored relative
+/// to the run; one from outside it, like `touch -d` sets, is restored as it is.
+fn during(started_at: SystemTime, ended_at: SystemTime, meta: &fs::Metadata) -> bool {
+    meta.modified().is_ok_and(|modified| started_at <= modified && modified <= ended_at)
+}
+
+fn since_epoch(nanoseconds: i64) -> SystemTime {
+    let offset = Duration::from_nanos(nanoseconds.unsigned_abs());
+    if nanoseconds >= 0 { UNIX_EPOCH + offset } else { UNIX_EPOCH - offset }
+}
+
+/// Sets the modification time without following a symlink.
+fn set_modified(path: &Path, modified: SystemTime) -> io::Result<()> {
+    let since_epoch = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let times = [
+        libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT },
+        libc::timespec { tv_sec: since_epoch.as_secs() as libc::time_t, tv_nsec: since_epoch.subsec_nanos().into() },
+    ];
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: path is NUL-terminated and times has the two entries utimensat reads.
+    if unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Removes paths a run created, children before their parents.
+pub fn remove_created<'p>(paths: impl Iterator<Item = &'p PathBuf>) -> Result<()> {
+    for path in paths {
+        let removed = match fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
+            Ok(_) => fs::remove_file(path),
+            Err(error) => Err(error),
+        };
+        match removed {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                return Err(error).with_context(|| format!("removing {}", path.display()));
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -155,6 +245,59 @@ mod tests {
 
         assert_eq!(fs::read(root.join("link")).unwrap(), b"content");
         assert!(!stale.exists());
+    }
+
+    #[test]
+    fn hard_links_between_outputs_are_restored_as_links() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Store::open(store_dir.path().to_path_buf()).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(work.path()).unwrap();
+        let (binary, alias) = (root.join("tool-1234"), root.join("tool"));
+
+        let mut hasher = ContentHasher::in_memory();
+        let mut recorder = Recorder::new(&mut hasher, &[]);
+        let created = recorder.before_mutation(&binary, Effect::Create).unwrap();
+        fs::write(&binary, b"binary").unwrap();
+        recorder.mutated(created);
+        let linked = recorder.before_mutation(&alias, Effect::MakeLink).unwrap();
+        fs::hard_link(&binary, &alias).unwrap();
+        recorder.mutated(linked);
+        let outputs = capture(&recorder.finish(), &store).unwrap();
+        fs::remove_file(&binary).unwrap();
+        fs::remove_file(&alias).unwrap();
+        restore(&outputs, &store).unwrap();
+
+        let inode = |path: &Path| fs::metadata(path).unwrap().ino();
+        assert_eq!(inode(&binary), inode(&alias));
+        assert_eq!(fs::read(&binary).unwrap(), b"binary");
+    }
+
+    #[test]
+    fn restoring_keeps_the_order_of_modification_times() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Store::open(store_dir.path().to_path_buf()).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(work.path()).unwrap();
+        let (older, newer) = (root.join("z-older"), root.join("a-newer"));
+
+        let mut hasher = ContentHasher::in_memory();
+        let mut recorder = Recorder::new(&mut hasher, &[]);
+        for path in [&older, &newer] {
+            let mutation = recorder.before_mutation(path, Effect::Create).unwrap();
+            fs::write(path, b"x").unwrap();
+            recorder.mutated(mutation);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let outputs = capture(&recorder.finish(), &store).unwrap();
+        fs::remove_file(&older).unwrap();
+        fs::remove_file(&newer).unwrap();
+        restore(&outputs, &store).unwrap();
+
+        let modified = |path: &Path| fs::metadata(path).unwrap().modified().unwrap();
+        assert!(modified(&older) < modified(&newer));
+        let restore_started = SystemTime::now() - Duration::from_millis(10);
+        assert!(modified(&older) > restore_started, "restored outputs must be newer than the work tree");
     }
 
     #[test]

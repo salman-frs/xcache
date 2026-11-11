@@ -1,0 +1,121 @@
+name: Corpus
+
+on:
+  workflow_dispatch:
+    inputs:
+      projects:
+        description: Projects to measure, separated by spaces (all if empty)
+        required: false
+        default: ""
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: corpus-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.runner }})
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - uses: actions/upload-artifact@v7
+        with:
+          name: xcache-${{ runner.arch }}
+          path: target/release/xcache
+          if-no-files-found: error
+
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      projects: ${{ steps.list.outputs.projects }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: list
+        env:
+          PROJECTS: ${{ inputs.projects }}
+        # PROJECTS is split into names on purpose.
+        run: echo "projects=$(python3 corpus/corpus.py list $PROJECTS)" >> "$GITHUB_OUTPUT"
+
+  measure:
+    name: ${{ matrix.project.name }} (${{ matrix.runner }})
+    needs: [build, plan]
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        project: ${{ fromJSON(needs.plan.outputs.projects) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: xcache-${{ runner.arch }}
+          path: bin
+      - run: chmod +x bin/xcache
+
+      - if: matrix.project.ecosystem == 'go'
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+      - if: matrix.project.ecosystem == 'rust'
+        uses: dtolnay/rust-toolchain@stable
+      - if: matrix.project.ecosystem == 'node'
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - if: matrix.project.ecosystem == 'python'
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: false
+      - if: matrix.project.ecosystem == 'gradle'
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: |
+            17
+            21
+
+      - name: Measure
+        env:
+          PROJECT: ${{ matrix.project.name }}
+        run: python3 corpus/corpus.py run --xcache bin/xcache --work "$RUNNER_TEMP/corpus" --results results "$PROJECT"
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: result-${{ matrix.project.name }}-${{ runner.arch }}
+          path: results
+          if-no-files-found: error
+
+  report:
+    needs: measure
+    if: always() && needs.measure.result != 'skipped'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: result-*
+          path: results
+          merge-multiple: true
+      - run: python3 corpus/corpus.py report results/*.json --json summary.json > summary.md
+      - run: cat summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: corpus-summary
+          path: |
+            summary.md
+            summary.json

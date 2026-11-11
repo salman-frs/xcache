@@ -11,30 +11,54 @@ use serde::{Deserialize, Serialize};
 use crate::digest::Digest;
 use crate::observe::{Access, State};
 
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 const ENTRIES_PER_COMMAND: usize = 16;
 const COMPRESSION_LEVEL: i32 = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Input {
     pub access: Access,
+    #[serde(with = "crate::path_serde")]
     pub path: PathBuf,
     pub state: State,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Output {
+    #[serde(with = "crate::path_serde")]
     pub path: PathBuf,
     pub state: OutputState,
+    /// How long before the end of the run this was last modified, so restoring
+    /// can keep the order of modification times, which make and cargo compare.
+    #[serde(default)]
+    pub age_ns: u64,
+    /// The modification time the command chose, in nanoseconds since the epoch,
+    /// which restoring sets as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chosen_mtime_ns: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OutputState {
     Deleted,
-    Dir { mode: u32 },
-    File { mode: u32, size: u64, content: Digest },
-    Symlink { target: PathBuf },
+    Dir {
+        mode: u32,
+    },
+    File {
+        mode: u32,
+        size: u64,
+        content: Digest,
+    },
+    /// Another name for an output earlier in path order.
+    HardLink {
+        #[serde(with = "crate::path_serde")]
+        target: PathBuf,
+    },
+    Symlink {
+        #[serde(with = "crate::path_serde")]
+        target: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +210,13 @@ impl Store {
         entries.retain(|existing| !same_inputs(existing, &entry));
         entries.insert(0, entry);
         entries.truncate(ENTRIES_PER_COMMAND);
+        self.write_entries(fingerprint, &entries)
+    }
+
+    pub fn remove(&self, fingerprint: Digest, entry: &Entry) -> io::Result<()> {
+        let _lock = self.lock()?;
+        let mut entries = self.entries(fingerprint)?;
+        entries.retain(|existing| !same_inputs(existing, entry));
         self.write_entries(fingerprint, &entries)
     }
 
@@ -342,6 +373,8 @@ mod tests {
         let output = Output {
             path: "/out".into(),
             state: OutputState::File { mode: 0o644, size: payload.len() as u64, content },
+            age_ns: 0,
+            chosen_mtime_ns: None,
         };
         let result = RunResult { exit_code: 0, stdio: store.put_bytes(b"").unwrap(), outputs: vec![output] };
         let inputs =

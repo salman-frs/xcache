@@ -1,29 +1,30 @@
 mod filter;
-mod net;
+pub(crate) mod net;
 mod syscalls;
 mod tracee;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsStr};
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use nix::errno::Errno;
 use nix::sys::ptrace::{self, Event, Options};
 use nix::sys::signal::{self, Signal};
-use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 
 use crate::invocation::Invocation;
 use crate::observe::Access;
 use crate::record::{Effect, Mutation, Recorder, Recording};
 use filter::Filter;
+use net::Destination;
 use syscalls::Call;
 
 const NAMESPACE_FLAGS: u64 = (libc::CLONE_NEWNS
@@ -38,6 +39,7 @@ const CLONE_UNTRACED: u64 = libc::CLONE_UNTRACED as u64;
 const RESOLVE_IN_ROOT: u64 = 0x10;
 const STATUS_FD: RawFd = 3;
 const LEFTOVER_PROCESSES: &str = "left processes running after it exited (they were terminated)";
+const NO_SIGNAL: i32 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
@@ -357,6 +359,8 @@ enum Pending {
     Rename { from: Mutation, to: Mutation },
     UntracedChild,
     Accept,
+    Connect { fd: i32, destination: Destination },
+    Bind { socket: PathBuf, mutation: Option<Mutation> },
 }
 
 enum Resume {
@@ -371,6 +375,11 @@ struct Tracer<'h> {
     root_exit: Option<Exit>,
     exec_seen: bool,
     untraced_children: Vec<Pid>,
+    opened_connections: HashSet<SocketAddr>,
+    known_listeners: net::KnownListeners,
+    /// Sockets the command bound, by device and inode, which renames and links
+    /// to them keep.
+    bound_sockets: HashSet<(u64, u64)>,
 }
 
 impl<'h> Tracer<'h> {
@@ -382,13 +391,16 @@ impl<'h> Tracer<'h> {
             root_exit: None,
             exec_seen: false,
             untraced_children: Vec::new(),
+            opened_connections: HashSet::new(),
+            known_listeners: net::KnownListeners::new(),
+            bound_sockets: HashSet::new(),
         }
     }
 
     /// Returns false if the child exited before stopping, so tracing could not be set up.
     fn attach(&mut self) -> Result<bool> {
-        match waitpid(self.root, Some(WaitPidFlag::__WALL)).context("waiting for the command to start")? {
-            WaitStatus::Stopped(_, Signal::SIGSTOP) => {}
+        match wait_for(Some(self.root)).context("waiting for the command to start")? {
+            Stop::Signal(_, libc::SIGSTOP) => {}
             _ => return Ok(false),
         }
         let options = Options::PTRACE_O_TRACESYSGOOD
@@ -406,24 +418,21 @@ impl<'h> Tracer<'h> {
 
     fn run_until_all_exit(&mut self) -> Result<()> {
         loop {
-            let status = match waitpid(None, Some(WaitPidFlag::__WALL)) {
-                Ok(status) => status,
-                Err(Errno::EINTR) => continue,
-                Err(Errno::ECHILD) => return Ok(()),
+            let stop = match wait_for(None) {
+                Ok(stop) => stop,
+                Err(error) if error.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => return Ok(()),
                 Err(error) => return Err(error).context("waitpid"),
             };
-            if let Some(pid) = status.pid()
-                && self.outlives_root(pid, &status)
-            {
+            if self.outlives_root(&stop) {
                 continue;
             }
-            match status {
-                WaitStatus::Exited(pid, code) => self.exited(pid, Exit::Code(code)),
-                WaitStatus::Signaled(pid, signal, _) => self.exited(pid, Exit::Signal(signal as i32)),
-                WaitStatus::PtraceEvent(pid, _, event) => self.ptrace_event(pid, event),
-                WaitStatus::PtraceSyscall(pid) => self.syscall_exit(pid),
-                WaitStatus::Stopped(pid, signal) => self.signal_stop(pid, signal),
-                _ => {}
+            match stop {
+                Stop::Exited(pid, code) => self.exited(pid, Exit::Code(code)),
+                Stop::Killed(pid, signal) => self.exited(pid, Exit::Signal(signal)),
+                Stop::Event(pid, event) => self.ptrace_event(pid, event),
+                Stop::Syscall(pid) => self.syscall_exit(pid),
+                Stop::Signal(pid, signal) => self.signal_stop(pid, signal),
             }
         }
     }
@@ -452,27 +461,30 @@ impl<'h> Tracer<'h> {
 
     /// A process first seen after the command exited is a leftover too: its
     /// fork event was still queued when the leftovers were terminated.
-    fn outlives_root(&mut self, pid: Pid, status: &WaitStatus) -> bool {
-        let still_running = !matches!(status, WaitStatus::Exited(..) | WaitStatus::Signaled(..));
-        if self.root_exit.is_none() || !still_running {
+    fn outlives_root(&mut self, stop: &Stop) -> bool {
+        let still_running = match *stop {
+            Stop::Exited(..) | Stop::Killed(..) => None,
+            Stop::Event(pid, _) | Stop::Syscall(pid) | Stop::Signal(pid, _) => Some(pid),
+        };
+        let (Some(pid), Some(_)) = (still_running, self.root_exit) else {
             return false;
-        }
+        };
         self.recorder.taint(LEFTOVER_PROCESSES);
         let _ = signal::kill(pid, Signal::SIGKILL);
-        resume(pid, None);
+        resume(pid, NO_SIGNAL);
         true
     }
 
-    fn signal_stop(&mut self, pid: Pid, signal: Signal) {
+    fn signal_stop(&mut self, pid: Pid, signal: i32) {
         let tracee = self.tracees.entry(pid).or_default();
-        if signal == Signal::SIGSTOP && !tracee.attached {
+        if signal == libc::SIGSTOP && !tracee.attached {
             tracee.attached = true;
-            resume(pid, None);
+            resume(pid, NO_SIGNAL);
             return;
         }
-        let is_group_stop = matches!(signal, Signal::SIGSTOP | Signal::SIGTSTP | Signal::SIGTTIN | Signal::SIGTTOU)
+        let is_group_stop = matches!(signal, libc::SIGSTOP | libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU)
             && ptrace::getsiginfo(pid).is_err();
-        resume(pid, if is_group_stop { None } else { Some(signal) });
+        resume(pid, if is_group_stop { NO_SIGNAL } else { signal });
     }
 
     fn ptrace_event(&mut self, pid: Pid, event: i32) {
@@ -480,7 +492,7 @@ impl<'h> Tracer<'h> {
             e if e == Event::PTRACE_EVENT_SECCOMP as i32 => {
                 let resume_mode = self.syscall_entry(pid);
                 match resume_mode {
-                    Resume::Continue => resume(pid, None),
+                    Resume::Continue => resume(pid, NO_SIGNAL),
                     Resume::UntilExit(pending) => {
                         self.tracees.entry(pid).or_default().pending = Some(pending);
                         if ptrace::syscall(pid, None).is_err() {
@@ -496,7 +508,7 @@ impl<'h> Tracer<'h> {
                 if let Ok(child) = ptrace::getevent(pid) {
                     self.tracees.entry(Pid::from_raw(child as i32)).or_default();
                 }
-                resume(pid, None);
+                resume(pid, NO_SIGNAL);
             }
             e if e == Event::PTRACE_EVENT_EXEC as i32 => {
                 self.exec_seen = true;
@@ -512,9 +524,9 @@ impl<'h> Tracer<'h> {
                 for file in tracee::mapped_files(pid) {
                     self.recorder.observe(Access::Read, &file);
                 }
-                resume(pid, None);
+                resume(pid, NO_SIGNAL);
             }
-            _ => resume(pid, None),
+            _ => resume(pid, NO_SIGNAL),
         }
     }
 
@@ -523,7 +535,7 @@ impl<'h> Tracer<'h> {
         if let (Some(pending), Ok(result)) = (pending, tracee::syscall_result(pid)) {
             self.complete(pending, result, pid);
         }
-        resume(pid, None);
+        resume(pid, NO_SIGNAL);
     }
 
     fn complete(&mut self, pending: Pending, result: i64, pid: Pid) {
@@ -539,11 +551,26 @@ impl<'h> Tracer<'h> {
             Pending::UntracedChild if result > 0 => self.untraced_children.push(Pid::from_raw(result as i32)),
             Pending::Accept if result >= 0 => {
                 let tracees: Vec<Pid> = self.tracees.keys().copied().collect();
-                if let Some(reason) = net::accepted_from_outside(pid, result as i32, &tracees) {
+                if let Some(reason) =
+                    net::accepted_from_outside(pid, result as i32, &tracees, &mut self.opened_connections)
+                {
                     self.recorder.taint(reason);
                 }
             }
-            Pending::Mutations(_) | Pending::Rename { .. } | Pending::UntracedChild | Pending::Accept => {}
+            Pending::Connect { fd, destination } => self.connected(pid, fd, &destination, result),
+            Pending::Bind { socket, mutation } if succeeded => {
+                if let Some(mutation) = mutation {
+                    self.recorder.mutated(mutation);
+                }
+                if let Ok(meta) = std::fs::metadata(&socket) {
+                    self.bound_sockets.insert((meta.dev(), meta.ino()));
+                }
+            }
+            Pending::Mutations(_)
+            | Pending::Rename { .. }
+            | Pending::UntracedChild
+            | Pending::Accept
+            | Pending::Bind { .. } => {}
         }
     }
 
@@ -626,11 +653,25 @@ impl<'h> Tracer<'h> {
             Call::Symlink { new_dirfd, new } => self.mutate(&[(path(new_dirfd, new)?, Effect::MakeLink)]),
             Call::Chmod { dirfd, path: address } => self.mutate(&[(path(dirfd, address)?, Effect::Chmod)]),
             Call::ChmodFd { fd } => self.mutate(&[(tracee::fd_path(pid, fd)?, Effect::Chmod)]),
+            Call::SetTimes { dirfd, path: address, flags, times, timespecs } => {
+                let target = if address == 0 { tracee::fd_path(pid, dirfd)? } else { path(dirfd, address)? };
+                let follows_symlinks = flags & libc::AT_SYMLINK_NOFOLLOW as u64 == 0;
+                if follows_symlinks && sets_a_modification_time(pid, times, timespecs) {
+                    self.mutate(&[(target, Effect::SetTimes)])
+                } else {
+                    self.recorder.before_times_change(&target, follows_symlinks);
+                    Resume::Continue
+                }
+            }
             Call::Truncate { path: address, length } => {
                 let effect = if length == 0 { Effect::TruncateToZero } else { Effect::Modify };
                 self.mutate(&[(path(libc::AT_FDCWD, address)?, effect)])
             }
-            Call::Connect { addr, len } | Call::SendTo { addr, len } => {
+            Call::Connect { fd, addr, len } => match net::read_sockaddr(pid, addr, len) {
+                Some(destination) => Resume::UntilExit(Pending::Connect { fd, destination }),
+                None => Resume::Continue,
+            },
+            Call::SendTo { addr, len } => {
                 self.check_peer(pid, addr, len);
                 Resume::Continue
             }
@@ -652,6 +693,14 @@ impl<'h> Tracer<'h> {
             Call::Clone { flags } => self.clone(flags),
             Call::Clone3 { args } => self.clone(u64::from_ne_bytes(tracee::read_exact(pid, args, 8)?.try_into().ok()?)),
             Call::Accept => Resume::UntilExit(Pending::Accept),
+            Call::Bind { addr, len } => match net::read_sockaddr(pid, addr, len) {
+                Some(Destination::UnixPath(path)) => {
+                    let socket = tracee::resolve(pid, libc::AT_FDCWD, &path)?;
+                    let mutation = self.recorder.before_mutation(&socket, Effect::MakeNode);
+                    Resume::UntilExit(Pending::Bind { socket, mutation })
+                }
+                _ => Resume::Continue,
+            },
             Call::Unsupported(reason) => {
                 self.recorder.taint(reason);
                 Resume::Continue
@@ -701,12 +750,49 @@ impl<'h> Tracer<'h> {
         if mutations.is_empty() { Resume::Continue } else { Resume::UntilExit(Pending::Mutations(mutations)) }
     }
 
+    /// A connection that reached nothing is an input: no file at a socket path,
+    /// or nothing bound to a loopback port. glibc connects datagram sockets,
+    /// without sending, to sort the addresses getaddrinfo returns.
+    fn connected(&mut self, pid: Pid, fd: i32, destination: &Destination, result: i64) {
+        let errno = -result as i32;
+        if let Destination::Loopback { .. } = destination
+            && errno != libc::ECONNREFUSED
+            && let Some(local) = net::local_address(pid, fd)
+        {
+            self.opened_connections.insert(local);
+        }
+        match destination {
+            Destination::UnixPath(path) if matches!(errno, libc::ENOENT | libc::ENOTDIR) => {
+                if let Some(path) = tracee::resolve(pid, libc::AT_FDCWD, path) {
+                    self.recorder.observe(Access::Stat, &path);
+                }
+            }
+            Destination::Loopback { port: 0, .. } => {}
+            Destination::Loopback { ip, port } if errno == libc::ECONNREFUSED => {
+                self.recorder.observe(Access::Listen, &net::port_key(false, SocketAddr::new(*ip, *port)));
+            }
+            Destination::Loopback { ip, port } if net::datagram_to_nobody(pid, fd, *port) => {
+                self.recorder.observe(Access::Listen, &net::port_key(true, SocketAddr::new(*ip, *port)));
+            }
+            _ => self.check_destination(pid, destination),
+        }
+    }
+
     fn check_peer(&mut self, pid: Pid, address: u64, length: u64) {
-        let Some(destination) = net::read_sockaddr(pid, address, length) else {
+        if let Some(destination) = net::read_sockaddr(pid, address, length) {
+            self.check_destination(pid, &destination);
+        }
+    }
+
+    fn check_destination(&mut self, pid: Pid, destination: &Destination) {
+        if let Destination::UnixPath(path) = destination
+            && let Some(meta) = tracee::resolve(pid, libc::AT_FDCWD, path).and_then(|path| std::fs::metadata(path).ok())
+            && self.bound_sockets.contains(&(meta.dev(), meta.ino()))
+        {
             return;
-        };
+        }
         let tracees: Vec<Pid> = self.tracees.keys().copied().collect();
-        if let Some(reason) = net::external_peer(pid, &destination, &tracees) {
+        if let Some(reason) = net::external_peer(pid, destination, &tracees, &mut self.known_listeners) {
             self.recorder.taint(reason);
         }
     }
@@ -727,6 +813,22 @@ impl<'h> Tracer<'h> {
     }
 }
 
+/// Whether a utime call sets a chosen modification time, as `touch -d` and
+/// `cp -p` do, rather than the current time or none.
+fn sets_a_modification_time(pid: Pid, times: u64, timespecs: bool) -> bool {
+    const TIMESPEC_SIZE: u64 = 16;
+    if times == 0 {
+        return false;
+    }
+    if !timespecs {
+        return true;
+    }
+    tracee::read_exact(pid, times + TIMESPEC_SIZE, TIMESPEC_SIZE as usize).is_some_and(|modified| {
+        let nanoseconds = i64::from_ne_bytes(modified[8..16].try_into().unwrap());
+        nanoseconds != libc::UTIME_NOW && nanoseconds != libc::UTIME_OMIT
+    })
+}
+
 fn is_running(pid: Pid) -> bool {
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;
@@ -735,8 +837,42 @@ fn is_running(pid: Pid) -> bool {
     !matches!(state, Some('Z' | 'X') | None)
 }
 
-fn resume(pid: Pid, signal: Option<Signal>) {
-    let _ = ptrace::cont(pid, signal);
+/// What waitpid reported. Signals stay numbers, because nix has no names for
+/// the real-time signals that glibc and the JVM send between their threads.
+enum Stop {
+    Exited(Pid, i32),
+    Killed(Pid, i32),
+    Event(Pid, i32),
+    Syscall(Pid),
+    Signal(Pid, i32),
+}
+
+fn wait_for(pid: Option<Pid>) -> io::Result<Stop> {
+    let mut status = 0;
+    // SAFETY: waitpid writes the status of one child into `status`.
+    let waited = unsafe { libc::waitpid(pid.map_or(-1, Pid::as_raw), &mut status, libc::__WALL) };
+    if waited < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let pid = Pid::from_raw(waited);
+    Ok(if libc::WIFEXITED(status) {
+        Stop::Exited(pid, libc::WEXITSTATUS(status))
+    } else if libc::WIFSIGNALED(status) {
+        Stop::Killed(pid, libc::WTERMSIG(status))
+    } else if libc::WSTOPSIG(status) == libc::SIGTRAP | 0x80 {
+        Stop::Syscall(pid)
+    } else if status >> 16 != 0 {
+        Stop::Event(pid, status >> 16)
+    } else {
+        Stop::Signal(pid, libc::WSTOPSIG(status))
+    })
+}
+
+fn resume(pid: Pid, signal: i32) {
+    // SAFETY: PTRACE_CONT takes no address and the signal to deliver as data.
+    unsafe {
+        libc::ptrace(libc::PTRACE_CONT, pid.as_raw(), std::ptr::null_mut::<libc::c_void>(), signal as libc::c_long)
+    };
 }
 
 #[cfg(test)]

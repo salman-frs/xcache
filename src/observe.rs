@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::digest::{ContentHasher, Digest};
+use crate::git;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -18,6 +19,8 @@ pub enum Access {
     Lstat,
     List,
     Writable,
+    /// Whether anything is bound to a loopback address, named like `tcp:127.0.0.1:8080`.
+    Listen,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,18 +30,22 @@ pub enum State {
     File {
         size: u64,
         mode: u32,
+        /// None when the command only checked a file it may not read.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         content: Option<Digest>,
     },
     Dir {
+        #[serde(with = "crate::path_serde")]
         real_path: PathBuf,
         mode: u32,
     },
     Listing {
+        #[serde(with = "crate::path_serde")]
         real_path: PathBuf,
         entries: Digest,
     },
     Symlink {
+        #[serde(with = "crate::path_serde")]
         target: PathBuf,
     },
     Writable {
@@ -99,11 +106,11 @@ pub type Listing = BTreeMap<OsString, EntryKind>;
 pub fn probe(access: Access, path: &Path, hasher: &mut ContentHasher) -> State {
     match access {
         Access::Read => match fs::metadata(path) {
-            Ok(meta) => describe(path, &meta, Some(hasher)),
+            Ok(meta) => describe(access, path, &meta, hasher),
             Err(error) => from_error(&error),
         },
         Access::Stat => match fs::metadata(path) {
-            Ok(meta) => describe(path, &meta, None),
+            Ok(meta) => describe(access, path, &meta, hasher),
             Err(error) => from_error(&error),
         },
         Access::Lstat => match fs::symlink_metadata(path) {
@@ -111,7 +118,7 @@ pub fn probe(access: Access, path: &Path, hasher: &mut ContentHasher) -> State {
                 Ok(target) => State::Symlink { target },
                 Err(error) => from_error(&error),
             },
-            Ok(meta) => describe(path, &meta, None),
+            Ok(meta) => describe(access, path, &meta, hasher),
             Err(error) => from_error(&error),
         },
         Access::List => match read_listing(path) {
@@ -122,7 +129,28 @@ pub fn probe(access: Access, path: &Path, hasher: &mut ContentHasher) -> State {
         Access::Writable => {
             State::Writable { parent_is_dir: path.parent().is_some_and(Path::is_dir), is_dir: path.is_dir() }
         }
+        Access::Listen => match crate::trace::net::is_bound(path) {
+            Some(true) => State::Special { kind: SpecialKind::Socket },
+            Some(false) => State::Missing,
+            None => State::Error { errno: libc::EINVAL },
+        },
     }
+}
+
+/// Whether a file recorded as `state` still has the same type, size and
+/// permissions, which is cheaper to check than its content.
+pub fn file_metadata_matches(access: Access, path: &Path, state: &State) -> bool {
+    let State::File { size, mode, .. } = state else {
+        return false;
+    };
+    let meta = if access == Access::Lstat { fs::symlink_metadata(path) } else { fs::metadata(path) };
+    meta.is_ok_and(|meta| meta.is_file() && recorded_size(path, &meta) == *size && permission_bits(&meta) == *mode)
+}
+
+/// Git's bookkeeping files are compared by a digest that leaves out what
+/// differs between checkouts, which changes their size too.
+fn recorded_size(path: &Path, meta: &fs::Metadata) -> u64 {
+    if git::is_bookkeeping(path) { 0 } else { meta.len() }
 }
 
 pub fn read_listing(dir: &Path) -> io::Result<Listing> {
@@ -147,14 +175,18 @@ pub fn listing_state(dir: &Path, listing: &Listing) -> State {
     }
 }
 
-fn describe(path: &Path, meta: &fs::Metadata, hasher: Option<&mut ContentHasher>) -> State {
+/// Files are described by content even when the command only checked their
+/// metadata: tools such as make and git compare modification times, and content
+/// is what those times stand for, without changing on every checkout.
+fn describe(access: Access, path: &Path, meta: &fs::Metadata, hasher: &mut ContentHasher) -> State {
     let file_type = meta.file_type();
     if file_type.is_file() {
-        let content = match hasher.map(|hasher| hasher.hash_file(path)).transpose() {
-            Ok(content) => content,
+        let content = match hasher.hash_file(path) {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied && access != Access::Read => None,
             Err(error) => return from_error(&error),
         };
-        State::File { size: meta.len(), mode: permission_bits(meta), content }
+        State::File { size: recorded_size(path, meta), mode: permission_bits(meta), content }
     } else if file_type.is_dir() {
         match fs::canonicalize(path) {
             Ok(real_path) => State::Dir { real_path, mode: permission_bits(meta) },
@@ -199,16 +231,16 @@ mod tests {
     }
 
     #[test]
-    fn read_sees_content_and_stat_does_not() {
+    fn metadata_checks_see_content_changes_of_the_same_size() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("a");
         fs::write(&file, b"one").unwrap();
-        let read = probe_now(Access::Read, &file);
-        let stat = probe_now(Access::Stat, &file);
+        let before: Vec<State> = [Access::Read, Access::Stat, Access::Lstat].map(|a| probe_now(a, &file)).into();
 
         fs::write(&file, b"two").unwrap();
-        assert_ne!(probe_now(Access::Read, &file), read);
-        assert_eq!(probe_now(Access::Stat, &file), stat);
+        for (access, state) in [Access::Read, Access::Stat, Access::Lstat].into_iter().zip(before) {
+            assert_ne!(probe_now(access, &file), state, "{access:?}");
+        }
     }
 
     #[test]

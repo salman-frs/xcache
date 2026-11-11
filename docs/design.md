@@ -47,10 +47,32 @@ the corresponding system calls can tell the command (`observe.rs`):
 | Access | Comes from | Recorded state |
 |---|---|---|
 | `read` | `open` for reading, `execve`, files mapped by `execve` | content (BLAKE3), size, permission bits |
-| `stat` | `stat`, `statx`, `access`, `chdir`, `open(O_PATH)` | type, size, permission bits |
+| `stat` | `stat`, `statx`, `access`, `chdir`, `open(O_PATH)` | type, permission bits; size and content for a file |
 | `lstat` | `lstat`, `readlink`, `AT_SYMLINK_NOFOLLOW`, `O_NOFOLLOW` | as `stat`, or the target of a symlink |
 | `list` | `getdents64` | names and types of the entries |
 | `writable` | create with truncation | whether the parent is a directory, whether the path is one |
+| `listen` | a connection to a loopback port that reached nothing | whether anything is bound to the port |
+
+A `stat` can't see a file's content, but it does see its modification time,
+and make, ninja, git and Python's bytecode cache decide what to do by comparing
+those times. A command that found `main.o` newer than `main.c` and did nothing
+would otherwise hit after `main.c` was edited to different content of the same
+size. Times change on every checkout, so they can't be part of the key. A file's
+content is recorded instead: when it is unchanged, so is anything the command
+could have derived from its time, as long as the command is deterministic.
+
+Git's bookkeeping needs a closer look. The index (`.git/index`) keeps the
+inode, times and size of every tracked file, and the reflogs (`.git/logs/`)
+record who moved HEAD and when, with an identity that names the machine when no
+user is configured. Two checkouts of the same commit differ in both, and cargo
+and `go build` read them on every build. The index digest covers the paths,
+modes, object IDs and flags of its entries, and its extensions except the
+offset tables that follow from the entries; a reflog digest covers each entry's
+object IDs and message (`git.rs`). Git uses the entries' stat data only to skip
+re-reading work tree files, and those files are inputs by content. The
+untracked cache (`core.untrackedCache`) is different: git trusts its listings
+while directory times match, so it stays in the digest, and checkouts that use
+it miss.
 
 A path that doesn't exist is recorded as missing. This matters for search
 paths: a compiler that finds `config.h` in its fifth include directory has
@@ -70,13 +92,13 @@ lookup sees the change. Paths under `/proc` are resolved first, because
 ### Deferred hashing
 
 Hashing each file when it is opened would stall the command. Instead, a read
-records the file's device, inode, size, mtime and ctime, and the content is
-hashed after the command exits. If those have changed by then, another process
-modified the file during the run, and the result is not stored.
+or `stat` of a file records its device, inode, size, mtime and ctime, and the
+content is hashed after the command exits. If those have changed by then,
+another process modified the file during the run, and the result is not stored.
 
 If the command itself writes to a file it read earlier, the pending hash is
 computed before the write goes through, so the recorded content is what the
-command read (`record.rs`, `settle_deferred_reads_of`).
+command read (`record.rs`, `settle_deferred_observations_of`).
 
 ## Writes
 
@@ -93,7 +115,7 @@ recorded as an input:
 | open for writing without `O_TRUNC`, `O_RDONLY\|O_CREAT`, `truncate` to a non-zero length | `read`, hashed immediately |
 | `rmdir` | `list` |
 | rename source | `read` for a file, `lstat` for a symlink; a directory the command didn't create makes the run uncacheable |
-| `chmod`, `fchmod` | `read` |
+| `chmod`, `fchmod`, setting a chosen time with `utimensat` | `read` |
 | `truncate` to zero | `stat` |
 
 Opening, truncating or chmodding a symlink changes the file it points to. In
@@ -136,6 +158,13 @@ file content and permission bits, directories, symlinks, and deletions
 (`outputs.rs`). Directories that were renamed into place are walked. Paths
 that didn't exist before the run and don't exist after it are skipped, which
 drops compiler temporaries with random names.
+
+Restored files get modification times in the order the run left them, a
+microsecond apart just before the restore, so build tools see them as newer
+than the checkout they are restored into. A file whose time the command set to
+a value from before or after the run, as `touch -d` and `cp -p` do, gets that
+time back. A time within the run, like cargo dating dep-info files to the start
+of the build, is about the run, and is restored in order with the rest.
 
 Restoring removes deleted paths first, deepest first, then creates
 directories, files and symlinks in path order. Files are written under a
@@ -207,6 +236,11 @@ capturing the outputs shows what actually happened.
 - a loopback port or Unix socket is allowed only if the socket on the other
   end belongs to a traced process, which is checked with `/proc/<pid>/net/*`
   and the processes' file descriptors;
+- a connection that reaches nothing is an input instead: a socket path with
+  no file is a missing path, and a refused loopback port, or a datagram socket
+  connected to a port nothing is bound to, is a `listen` input. glibc's
+  getaddrinfo connects datagram sockets, without sending, to sort the
+  addresses it returns, and checks for `nscd`'s socket on every lookup;
 - netlink sockets, which only talk to the kernel, are allowed.
 
 An accepted TCP connection gets the same check from the other side.
@@ -214,7 +248,7 @@ An accepted TCP connection gets the same check from the other side.
 ## Shadow mode
 
 `--shadow` runs the command on a hit, records it, and compares the two
-results (`run.rs`). If they differ:
+results (`run.rs`). If they differ, or the fresh run is not cacheable:
 
 - `nondeterministic` means the fresh run read the same inputs, with the same
   states, as the cached run;
@@ -222,6 +256,15 @@ results (`run.rs`). If they differ:
 
 Paths that didn't exist are ignored in this comparison. Programs pick random
 names for temporary files, so every run checks different missing paths.
+
+When the result is `correct` or `nondeterministic`, xcache restores the cached
+outputs and exits with the cached status, as a hit would. Otherwise every
+nondeterministic command would change the inputs of the commands after it, and
+those commands would miss under `--shadow` where they hit without it, so their
+hits would never be checked. Files only the fresh run created are removed, but
+a file it changed that the cached run left alone keeps the change, since its
+earlier content was not stored. A false hit keeps the fresh result, and the
+entry that produced it is removed so that later runs can't reuse it.
 
 ## Store
 

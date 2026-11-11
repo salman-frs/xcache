@@ -53,11 +53,16 @@ the cache with a new project. It reports one of:
 
 - `correct`: same files, same output, same exit status.
 - `nondeterministic`: the fresh run read exactly the same inputs but produced
-  different output. A date written to a log file, or the output of a parallel
-  `make` interleaving differently, looks like this.
+  different output, or failed. A date written to a log file, the output of a
+  parallel `make` interleaving differently, or a flaky test looks like this.
 - `false_hit`: the fresh run depended on something the cached run didn't
   record. That is a bug in xcache. Please open an issue with the `--report`
   output.
+
+Unless it finds a false hit, shadow mode then leaves the cached files and exit
+status in place, as a hit would, so the commands after it see the same files
+with and without `--shadow`. After a false hit it keeps the fresh result and
+removes the wrong entry from the cache.
 
 ### Environment variables
 
@@ -90,6 +95,16 @@ Until there is a remote cache, keep the cache directory between runs with
 `npm ci` is not wrapped because it downloads packages, and commands that use
 the network are never cached.
 
+Some tools keep caches of their own that change on every run, so a step that
+reads them never hits. Turn them off in jobs that use xcache:
+
+- Node's module compile cache, which npm enables:
+  `NODE_DISABLE_COMPILE_CACHE=1`.
+- npm's debug logs, which npm rotates by listing their directory:
+  `npm_config_logs_max=0`.
+- Go's usage counters, which the go command updates on every run, where the
+  home directory persists between runs: `go telemetry off`.
+
 ### Cache location and size
 
 The cache is stored in `$XCACHE_DIR`, or `$XDG_CACHE_HOME/xcache`, or
@@ -107,7 +122,7 @@ A command still runs normally, but its result is not stored, when it:
 
 - exits with a non-zero status;
 - connects to the network, or to a local service it didn't start itself
-  (Docker, a database, `nscd`), or accepts a connection from one;
+  (Docker, a database, a DNS resolver), or accepts a connection from one;
 - leaves processes running after it exits (xcache kills them);
 - creates namespaces, mounts filesystems, or calls `chroot`;
 - renames a directory it didn't create;
@@ -115,36 +130,52 @@ A command still runs normally, but its result is not stored, when it:
 
 xcache prints the reason when this happens.
 
+A connection that finds nothing, such as glibc checking for `nscd`'s socket or
+probing `localhost` to sort the addresses it resolved, only shows that nothing
+is there. That is recorded as an input, so the command misses if a service
+appears there later.
+
 ## Known caveats
 
 - The clock and random numbers can't be traced. If a command writes a
   timestamp into a file, a cache hit restores the old timestamp.
 - Reads under `/proc`, `/sys` and `/dev` (except `/dev/shm`) are not tracked.
   CPU counts and cgroup limits count as properties of the machine.
-- Restored files get the recorded content and permissions, but the current
-  time and the current user as owner.
+- Restored files get the recorded content and permissions, and modification
+  times in the order the original run left them, ending at the time of the
+  restore. Their owner is the current user.
+- A `stat` of a file records its content, which stands in for its modification
+  time: make, ninja and git compare times, and times change on every checkout.
+  Touching a file without changing it doesn't cause a miss.
+- Git's index and reflogs are compared without the stat data, times and
+  identities they keep about the checkout. Like the clock, a command that
+  prints reflog dates or names gets the cached ones on a hit.
 - A miss is slower than running the command directly, because every traced
   system call stops in xcache. See [Performance](#performance).
 - Many tools check whether their outputs exist, so in a working tree that
   already has build output the first run misses once.
+- For a build script without `rerun-if-changed`, cargo stores the newest
+  modification time of the package's files. After a hit in a fresh checkout,
+  a cargo command that misses reruns that package's build script once.
 - Build daemons (Gradle, Bazel, sccache) outlive the command that starts them,
-  so those runs are not cached.
+  so those runs are not cached. Run Gradle without them:
+  `./gradlew --no-daemon -Pkotlin.compiler.execution.strategy=in-process build`.
 - If ptrace or seccomp filters are not allowed, as in some sandboxes, xcache
   says so and runs the command without caching.
 
 ## Performance
 
-We ran three projects through a simulated CI run, starting from a fresh
-checkout with empty `GOCACHE`, `GOPATH` and `target/` each time, on
-Ubuntu 24.04 (aarch64, 4 vCPUs):
+The [shadow corpus](docs/corpus.md) runs the build and test steps of 29 open
+source projects (Go, Rust, Node, Python, Gradle and CMake) from fresh checkouts
+on GitHub's x86_64 and aarch64 runners. In the [latest
+results](docs/corpus-results.md):
 
-| Project | Steps | Without xcache | Miss | Hit |
-|---|---|---|---|---|
-| [google/uuid](https://github.com/google/uuid) | `go vet`, `go build`, `go test` | 6.0s | 9.8s | 0.48s |
-| xcache | `cargo build --release`, `cargo test --release --lib` | 29.9s | 36.6s | 0.56s |
-| [madler/zlib](https://github.com/madler/zlib) | `./configure`, `make -j4`, `make test` | 1.5s | 2.3s | 0.03s |
-
-Shadow mode found no false hits in these runs.
+- 93% of steps are cacheable, and all of those hit from a fresh checkout of the
+  same commit.
+- A miss takes 21% longer than running the command directly (median), from +8%
+  for CMake to +29% for Gradle.
+- A hit is 15x to 48x faster than running the step (median per ecosystem).
+- Shadow mode found no wrong result.
 
 ## How it works
 
@@ -174,7 +205,6 @@ writing a cache key. Roughly in order:
   [Bazel Remote Execution API](https://github.com/bazelbuild/remote-apis), and
   a GitHub Action.
 - Signed cache entries, and read-only access for untrusted pull requests.
-- A published false-hit rate from running shadow mode on popular projects.
 - [SLSA](https://slsa.dev/) provenance built from the recorded inputs.
 - macOS hosts.
 
@@ -191,7 +221,7 @@ writing a cache key. Roughly in order:
 
 ## Development
 
-The tests need `sh`, `gcc`, `go` and `python3`:
+The tests need `sh`, `gcc`, `go`, `python3` and `git`:
 
 ```sh
 cargo test
