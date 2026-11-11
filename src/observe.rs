@@ -158,8 +158,12 @@ pub fn file_metadata_matches(access: Access, path: &Path, state: &State) -> bool
     let State::File { size, mode, .. } = state else {
         return false;
     };
-    let meta = if access == Access::Lstat { fs::symlink_metadata(path) } else { fs::metadata(path) };
-    meta.is_ok_and(|meta| meta.is_file() && recorded_size(path, &meta) == *size && permission_bits(&meta) == *mode)
+    metadata(access, path)
+        .is_ok_and(|meta| meta.is_file() && recorded_size(path, &meta) == *size && permission_bits(&meta) == *mode)
+}
+
+pub fn metadata(access: Access, path: &Path) -> io::Result<fs::Metadata> {
+    if access == Access::Lstat { fs::symlink_metadata(path) } else { fs::metadata(path) }
 }
 
 /// Git's bookkeeping files are compared by a digest that leaves out what

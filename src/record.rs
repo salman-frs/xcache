@@ -105,10 +105,10 @@ pub struct Recorder<'h> {
 }
 
 impl<'h> Recorder<'h> {
-    pub fn new(hasher: &'h mut ContentHasher, private_dirs: &[&Path]) -> Self {
+    pub fn new(hasher: &'h mut ContentHasher, excluded: &[&Path]) -> Self {
         Self {
             hasher,
-            excluded: private_dirs.iter().map(|dir| dir.to_path_buf()).collect(),
+            excluded: excluded.iter().map(|dir| dir.to_path_buf()).collect(),
             observations: Vec::new(),
             seen: HashMap::new(),
             deferred_by_path: HashMap::new(),
@@ -305,7 +305,7 @@ impl<'h> Recorder<'h> {
         let path = if requested.starts_with("/proc") { real.as_path() } else { requested };
 
         let recorded = match access {
-            Access::Read | Access::Stat | Access::Lstat if !hash_now => match metadata(access, path) {
+            Access::Read | Access::Stat | Access::Lstat if !hash_now => match observe::metadata(access, path) {
                 Ok(meta) if meta.is_file() => Recorded::Deferred(Identity::of(&meta)),
                 _ => Recorded::Known(observe::probe(access, path, self.hasher)),
             },
@@ -351,7 +351,7 @@ impl<'h> Recorder<'h> {
     }
 
     fn settle(&mut self, access: Access, path: &Path, identity: Identity) -> State {
-        let unchanged = metadata(access, path).is_ok_and(|meta| Identity::of(&meta) == identity);
+        let unchanged = observe::metadata(access, path).is_ok_and(|meta| Identity::of(&meta) == identity);
         if !unchanged {
             self.taint(format!("input changed while the command ran: {}", path.display()));
         }
@@ -410,10 +410,6 @@ fn symlink_chain(link: &Path) -> Vec<PathBuf> {
 
 fn is_machine_state(real: &Path) -> bool {
     real.starts_with("/proc") || real.starts_with("/sys") || (real.starts_with("/dev") && !real.starts_with("/dev/shm"))
-}
-
-fn metadata(access: Access, path: &Path) -> std::io::Result<fs::Metadata> {
-    if access == Access::Lstat { fs::symlink_metadata(path) } else { fs::metadata(path) }
 }
 
 /// Where a path really lives: its parent directory with symlinks and `..`

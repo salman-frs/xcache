@@ -25,3 +25,6 @@ tempfile = "3"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
