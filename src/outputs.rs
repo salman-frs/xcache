@@ -68,10 +68,8 @@ pub fn capture(recording: &Recording, store: &Store) -> Result<Vec<Output>> {
     Ok(outputs)
 }
 
-/// Restored outputs keep the order of their modification times, a microsecond
-/// apart and just before the restore: newer than the work tree they are restored
-/// into, as they were when the command made them, so make and cargo see them as
-/// up to date.
+/// Restored outputs are dated a step apart, in their original order, just before
+/// the restore, so make and cargo see them as newer than the work tree.
 const MODIFICATION_STEP: Duration = Duration::from_micros(1);
 
 /// Relies on outputs being sorted by path, so parents come before their children.
@@ -119,10 +117,8 @@ pub fn restore(outputs: &[Output], store: &Store) -> Result<()> {
     Ok(())
 }
 
-/// A time chosen within the run, like cargo dating dep-info files to the start
-/// of the build, describes the run and is restored relative to it like any
-/// other. A time from before or after it, like `touch -d` or `cp -p` give, is
-/// restored as it is.
+/// A time chosen within the run, like cargo's dep-info dates, is restored relative
+/// to the run; one from outside it, like `touch -d` sets, is restored as it is.
 fn during(started_at: SystemTime, ended_at: SystemTime, meta: &fs::Metadata) -> bool {
     meta.modified().is_ok_and(|modified| started_at <= modified && modified <= ended_at)
 }

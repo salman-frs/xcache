@@ -29,8 +29,8 @@ The commits are the pinned commit and the first-parent commits before it.
 ## What the summary reports
 
 - **False hits**: shadow runs whose verdict was `false_hit`, with the inputs
-  the cached run missed. Each one is a bug, and gets a test in
-  [tests/traps.rs](../tests/traps.rs).
+  the cached run missed. Each one that gives a wrong result is a bug, and gets
+  a test in [tests/traps.rs](../tests/traps.rs).
 - **Cacheable**: steps whose cold run was stored, out of all steps. The
   summary groups the reasons the others were not stored.
 - **Miss overhead**: wall time of the cold phase over the baseline, both
@@ -57,11 +57,11 @@ pick. On Linux:
 ```sh
 cargo build --release
 python3 corpus/corpus.py run --xcache target/release/xcache koa zlib
-python3 corpus/corpus.py report results/*.json
+python3 corpus/corpus.py report corpus/results/*.json
 ```
 
-`run` writes `results/<project>-<arch>.json`, plus the logs and xcache reports
-of every step under `results/logs/`. It works in `/tmp/xcache-corpus` and
+`run` writes `corpus/results/<project>-<arch>.json`, plus the logs and xcache
+reports of every step under `corpus/results/logs/`. It works in `/tmp/xcache-corpus` and
 deletes each project's directory when the project is done, unless you pass
 `--keep`.
 

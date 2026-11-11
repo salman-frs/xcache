@@ -1,9 +1,5 @@
-//! Git keeps bookkeeping about each checkout next to the repository: the index
-//! stores the stat data (times, inode, size) of every tracked file, and the
-//! reflogs record who moved HEAD and when. Two checkouts of the same commit
-//! differ there, and cargo and `go build` read both. The digests here leave
-//! that bookkeeping out. A command that relies on the index's stat data
-//! compares it with the work tree, whose files xcache records by content.
+//! Digests of git's index and reflogs without the stat data, times and
+//! identities that differ between two checkouts of the same commit.
 
 use std::ffi::OsStr;
 use std::path::{Component, Path};

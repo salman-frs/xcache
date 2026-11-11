@@ -750,27 +750,25 @@ impl<'h> Tracer<'h> {
         if mutations.is_empty() { Resume::Continue } else { Resume::UntilExit(Pending::Mutations(mutations)) }
     }
 
-    /// A connection that reached no one only showed that nothing was there: no
-    /// file at a socket path (nscd's, when nscd is not running), or nothing
-    /// bound to a loopback port. A socket file nobody listens on is not like
-    /// that, because a service can start listening on the same kind of file. glibc connects datagram sockets, without
-    /// sending, to sort the addresses getaddrinfo returns.
+    /// A connection that reached nothing is an input: no file at a socket path,
+    /// or nothing bound to a loopback port. glibc connects datagram sockets,
+    /// without sending, to sort the addresses getaddrinfo returns.
     fn connected(&mut self, pid: Pid, fd: i32, destination: &Destination, result: i64) {
-        let found_nothing = matches!(-result as i32, libc::ENOENT | libc::ENOTDIR | libc::ECONNREFUSED);
+        let errno = -result as i32;
         if let Destination::Loopback { .. } = destination
-            && !found_nothing
+            && errno != libc::ECONNREFUSED
             && let Some(local) = net::local_address(pid, fd)
         {
             self.opened_connections.insert(local);
         }
         match destination {
-            Destination::UnixPath(path) if -result == libc::ENOENT as i64 || -result == libc::ENOTDIR as i64 => {
+            Destination::UnixPath(path) if matches!(errno, libc::ENOENT | libc::ENOTDIR) => {
                 if let Some(path) = tracee::resolve(pid, libc::AT_FDCWD, path) {
                     self.recorder.observe(Access::Stat, &path);
                 }
             }
             Destination::Loopback { port: 0, .. } => {}
-            Destination::Loopback { ip, port } if -result == libc::ECONNREFUSED as i64 => {
+            Destination::Loopback { ip, port } if errno == libc::ECONNREFUSED => {
                 self.recorder.observe(Access::Listen, &net::port_key(false, SocketAddr::new(*ip, *port)));
             }
             Destination::Loopback { ip, port } if net::datagram_to_nobody(pid, fd, *port) => {

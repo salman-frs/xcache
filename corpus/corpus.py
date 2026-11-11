@@ -2,8 +2,8 @@
 """Runs real projects' build and test steps under xcache and summarizes the results.
 
     corpus.py list [NAME...]                projects and their ecosystems, as JSON
-    corpus.py run --xcache BIN NAME...      measure projects, writing results/NAME-ARCH.json
-    corpus.py report results/*.json         write the summary as Markdown and JSON
+    corpus.py run --xcache BIN NAME...      measure projects, writing corpus/results/NAME-ARCH.json
+    corpus.py report corpus/results/*.json  write the summary as Markdown and JSON
 
 See docs/corpus.md for what each phase measures.
 """
@@ -15,6 +15,7 @@ import platform
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -23,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 CORPUS = Path(__file__).with_name("projects.toml")
+RESULTS = Path(__file__).with_name("results")
 STEP_TIMEOUT_SECONDS = 45 * 60
 DIFFERENCES_KEPT = 20
 
@@ -272,7 +274,7 @@ def run_logged(argv: list[str], cwd: Path, env: dict[str, str], log: Path) -> in
         try:
             return process.wait(timeout=STEP_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, 9)
+            os.killpg(process.pid, signal.SIGKILL)
             process.wait()
             output.write(b"\ncorpus: timed out\n")
             return 124
@@ -315,7 +317,6 @@ class ProjectSummary:
     miss_overhead: float | None
     hit_speedup: float | None
     warm_hits: int
-    warm_cacheable: int
     commit_runs: int
     commit_hits: int
     false_hits: list[dict]
@@ -366,7 +367,6 @@ def summarize_project(result: dict) -> ProjectSummary:
         miss_overhead=None if miss_overhead is None else miss_overhead - 1,
         hit_speedup=hit_speedup,
         warm_hits=len(warm_hit_steps),
-        warm_cacheable=len(cacheable_steps),
         commit_runs=len(commit_runs),
         commit_hits=sum(run["xcache"]["outcome"] == "hit" for run in commit_runs),
         false_hits=[finding(run) for run in shadowed if run["xcache"]["shadow"] == "false_hit"],
@@ -435,7 +435,7 @@ def render_report(summaries: list[ProjectSummary]) -> str:
     for s in sorted(summaries, key=lambda s: (s.ecosystem, s.name, s.arch)):
         lines.append(
             f"| {s.name} ({s.ecosystem}) | {s.arch} | {len(s.false_hits)} | {s.cacheable}/{s.steps} "
-            f"| {signed_percent(s.miss_overhead)} | {times(s.hit_speedup)} | {s.warm_hits}/{s.warm_cacheable} "
+            f"| {signed_percent(s.miss_overhead)} | {times(s.hit_speedup)} | {s.warm_hits}/{s.cacheable} "
             f"| {s.commit_hits}/{s.commit_runs} |"
         )
 
@@ -494,7 +494,7 @@ def main() -> int:
     run = commands.add_parser("run", help="measure projects")
     run.add_argument("--xcache", type=Path, required=True, help="the xcache binary to measure")
     run.add_argument("--work", type=Path, default=Path("/tmp/xcache-corpus"), help="scratch directory")
-    run.add_argument("--results", type=Path, default=Path("results"), help="where to write NAME.json")
+    run.add_argument("--results", type=Path, default=RESULTS, help="where to write NAME-ARCH.json")
     run.add_argument("--keep", action="store_true", help="keep each project's scratch directory")
     run.add_argument("names", nargs="+", metavar="NAME")
     report = commands.add_parser("report", help="summarize results")

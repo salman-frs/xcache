@@ -366,14 +366,9 @@ fn shadow_verdict(cached: &Entry, execution: &Execution) -> (ShadowVerdict, Vec<
     }
 }
 
-/// Inputs the fresh run depended on that the cached run did not record.
-/// Left out are:
-/// - paths that did not exist, or ran through a file: tools pick random names
-///   for temporary files, so each run probes different absent paths;
-/// - files the cached run recorded with the same content, whether it read them
-///   or only checked them, since a check records content too;
-/// - files the cached run wrote without looking at what was there before: its
-///   result does not depend on their earlier content, and a hit restores them.
+/// Inputs the fresh run depended on that the cached run did not record, leaving
+/// out absent paths, which differ for random temporary names, and files the
+/// cached run recorded with that content or overwrote without looking.
 fn unrecorded_inputs(cached: &Entry, fresh: &[Input]) -> Vec<String> {
     let recorded: HashMap<(Access, &Path), &State> =
         cached.inputs.iter().map(|input| ((input.access, input.path.as_path()), &input.state)).collect();

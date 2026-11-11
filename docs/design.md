@@ -93,8 +93,8 @@ lookup sees the change. Paths under `/proc` are resolved first, because
 
 Hashing each file when it is opened would stall the command. Instead, a read
 or `stat` of a file records its device, inode, size, mtime and ctime, and the
-content is hashed after the command exits. If those have changed by then, another process
-modified the file during the run, and the result is not stored.
+content is hashed after the command exits. If those have changed by then,
+another process modified the file during the run, and the result is not stored.
 
 If the command itself writes to a file it read earlier, the pending hash is
 computed before the write goes through, so the recorded content is what the
