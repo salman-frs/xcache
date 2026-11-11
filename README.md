@@ -199,11 +199,12 @@ The long-term goal is for every build and test step, in CI and on developer
 machines, to be cached this way and shared between machines, without anyone
 writing a cache key. Roughly in order:
 
-- A faster tracer based on seccomp user notifications, so a miss costs less
-  than 10% over an uncached run.
 - A remote cache using the
   [Bazel Remote Execution API](https://github.com/bazelbuild/remote-apis), and
   a GitHub Action.
+- A tracer that records file accesses without stopping the command, for
+  example with fanotify or eBPF, so a miss costs less than 10% over an uncached
+  run.
 - Signed cache entries, and read-only access for untrusted pull requests.
 - [SLSA](https://slsa.dev/) provenance built from the recorded inputs.
 - macOS hosts.

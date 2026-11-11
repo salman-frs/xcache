@@ -299,9 +299,12 @@ well.
 
 ## Open problems
 
-- Overhead. Every traced call is a round trip to one tracer thread, which
-  costs tens of microseconds in a VM. Seccomp user notifications would allow
-  several threads to answer calls and are the planned replacement.
+- Overhead. Every traced call waits for a round trip to the tracer. A tracer
+  built on seccomp user notifications (branch `perf/seccomp-unotify`) was no
+  faster than ptrace on GitHub's runners: +26.5% against +26.0% median on a
+  miss in an [A/B benchmark](https://github.com/salman-frs/xcache/actions/runs/43042700975).
+  Less than 10% needs recording accesses without stopping the command, as
+  fanotify or eBPF could.
 - The clock and randomness can't be observed without kernel changes. Shadow
   mode shows how much they matter for a project but doesn't fix them.
 - A shared cache needs signed entries and read-only access for untrusted
