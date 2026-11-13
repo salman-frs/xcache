@@ -65,7 +65,7 @@ reports of every step under `corpus/results/logs/`. It works in
 `/tmp/xcache-corpus` and deletes each project's directory when the project is
 done, unless you pass `--keep`.
 
-A full run takes about two hours, so pushes and pull requests don't start one.
+A full run takes about 45 minutes, so pushes and pull requests don't start one.
 Before merging a change to tracing, restoring or the corpus, run it on the
 branch, for all projects or some of them:
 

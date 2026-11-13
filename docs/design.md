@@ -406,18 +406,40 @@ blobs that no remaining entry uses, and deletes stat caches from other boots.
   went from +48% to +14% with the supervisor, the remembered lookups, early
   hashing and parallel storing together: none that could be measured for
   anyhow and commander, +10% to +15% for click, testify and koa, +27% for
-  uuid, +39% for markupsafe and +79% for zlib. The corpus has not been run on
-  GitHub's runners since.
+  uuid, +39% for markupsafe and +79% for zlib. On GitHub's runners the median
+  of the 29 corpus projects went from +21% to +12%
+  ([corpus-results.md](corpus-results.md)).
 
   Steps that are mostly path lookups stay expensive. In zlib's test step the
   supervisor spends about 5 microseconds on each of 72,000 notifications,
   three quarters of it in the kernel: two `ioctl` calls, a `poll` and a
-  `process_vm_readv`. Only 5,400 of those lookups name a path that is not
-  recorded yet, and dropping the repeats before they reach xcache takes code
-  in the kernel, as eBPF allows, or in the process. Having the tracer wait
-  actively instead of sleeping cut a ptrace stop from 30 to 9 microseconds in
-  a loop of calls and changed nothing in these steps, where the other CPUs
-  are busy anyway.
+  `process_vm_readv`. 87% of them repeat a call, flags and absolute path from
+  earlier in the run, which the recorder ignores. Dropping the repeats in the
+  kernel with eBPF was evaluated and not built:
+
+  - It does not reach +10%. With no read or probe stopped at all, zlib's
+    configure step still costs about +50% over a plain run, its test step
+    +39% to +66%, and `uv build` +23% to +35%.
+  - Seccomp decides before any eBPF program sees a call (`syscall_trace_enter`
+    in `kernel/entry/common.c` and `arch/arm64/kernel/ptrace.c`, Linux 6.8),
+    and its filters are classic BPF, without maps. Repeats can only run
+    unstopped if the filter lets every lookup through and an eBPF program
+    stops the new ones. A program that is not attached then means unrecorded
+    inputs, not a slower run.
+  - Only the absolute path is a safe key. The identity of a working directory
+    is not: the command can move a directory it created, and the same
+    relative path from it then names another file.
+
+  What remains is ptrace. In those zlib steps, a call that changes the
+  filesystem costs about 50 microseconds of wall time when it starts, of which
+  the tracer works for 17; together that is 27 to 30 points. Its second stop
+  costs little and is needed, because only a change that succeeded makes the
+  path the command's own. Forks, `execve`, exits and signals alone cost +10%
+  to +13%, so these steps cannot get under +10% while every process is traced
+  with ptrace. Having the tracer wait actively instead of sleeping cut a
+  ptrace stop from 30 to 9 microseconds in a loop of calls and changed nothing
+  in these steps, where the other CPUs are busy anyway; polling for the next
+  stop for up to 100 microseconds did not either.
 
   An earlier supervisor that always woke callers on its own CPU was no faster
   than ptrace on GitHub's runners (+26.5% against +26.0% median in an

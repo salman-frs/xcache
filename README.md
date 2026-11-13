@@ -174,14 +174,12 @@ results](docs/corpus-results.md):
 
 - 93% of steps are cacheable, and all of those hit from a fresh checkout of the
   same commit.
-- A miss takes 21% longer than running the command directly (median), from +8%
-  for CMake to +29% for Gradle.
-- A hit is 15x to 48x faster than running the step (median per ecosystem).
+- A miss takes 12% longer than running the command directly (median), from +2%
+  for CMake to +18% for Rust.
+- A hit is 12x to 56x faster than running the step (median per ecosystem).
 - Shadow mode found no wrong result.
 
-Those results are from before reads were recorded through a seccomp listener,
-which makes a miss cheaper. [docs/design.md](docs/design.md#open-problems) has
-what was measured since, and what remains slow.
+[docs/design.md](docs/design.md#open-problems) has what remains slow on a miss.
 
 ## How it works
 
@@ -211,8 +209,9 @@ writing a cache key. Roughly in order:
 - A remote cache using the
   [Bazel Remote Execution API](https://github.com/bazelbuild/remote-apis), and
   a GitHub Action.
-- Dropping repeated path lookups before they reach xcache, for example with
-  eBPF, so a miss costs less than 10% over an uncached run on every step.
+- A miss that costs less than 10% over an uncached run on every step. Steps
+  that start many processes or change many files pay for ptrace stops;
+  [docs/design.md](docs/design.md#open-problems) has the measurements.
 - Signed cache entries, and read-only access for untrusted pull requests.
 - [SLSA](https://slsa.dev/) provenance built from the recorded inputs.
 
