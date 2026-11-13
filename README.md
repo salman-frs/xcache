@@ -211,8 +211,9 @@ writing a cache key. Roughly in order:
 - A remote cache using the
   [Bazel Remote Execution API](https://github.com/bazelbuild/remote-apis), and
   a GitHub Action.
-- Dropping repeated path lookups before they reach xcache, for example with
-  eBPF, so a miss costs less than 10% over an uncached run on every step.
+- A miss that costs less than 10% over an uncached run on every step. Steps
+  that start many processes or change many files pay for ptrace stops;
+  [docs/design.md](docs/design.md#open-problems) has the measurements.
 - Signed cache entries, and read-only access for untrusted pull requests.
 - [SLSA](https://slsa.dev/) provenance built from the recorded inputs.
 
