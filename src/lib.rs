@@ -12,4 +12,5 @@ mod record;
 mod run;
 mod stdio;
 mod store;
+mod sync;
 mod trace;

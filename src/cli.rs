@@ -6,6 +6,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::run::{self, RunOptions};
 use crate::store::Store;
+use crate::trace::Tracing;
 
 /// Exit status when xcache itself fails, kept apart from the command's own statuses.
 const INTERNAL_ERROR: i32 = 125;
@@ -40,6 +41,11 @@ enum Commands {
         /// Only print xcache messages for errors and false hits
         #[arg(short, long)]
         quiet: bool,
+
+        /// Who sees the calls that only read: a seccomp listener where the
+        /// kernel offers one (auto), or ptrace like the other calls
+        #[arg(long, env = "XCACHE_TRACER", value_enum, default_value_t = Tracing::Auto)]
+        tracer: Tracing,
 
         #[command(flatten)]
         command: CommandLine,
@@ -85,9 +91,15 @@ fn dispatch(cli: Cli) -> Result<i32> {
         None => default_store_dir()?,
     };
     match cli.command {
-        Commands::Run { shadow, report, quiet, command } => {
-            run::run(RunOptions { argv: command.argv, pass_env: command.pass_env, store_dir, shadow, report, quiet })
-        }
+        Commands::Run { shadow, report, quiet, tracer, command } => run::run(RunOptions {
+            argv: command.argv,
+            pass_env: command.pass_env,
+            store_dir,
+            shadow,
+            report,
+            quiet,
+            tracing: tracer,
+        }),
         Commands::Explain { command } => run::explain(command.argv, &command.pass_env, store_dir).map(|()| 0),
         Commands::Gc { max_size } => {
             let stats = Store::open(store_dir)?.gc(max_size)?;

@@ -126,20 +126,20 @@ pub fn probe(access: Access, path: &Path, hasher: &mut ContentHasher) -> State {
     match access {
         Access::Read | Access::Stat => match fs::metadata(path) {
             Ok(meta) => describe(access, path, &meta, hasher),
-            Err(error) => from_error(&error),
+            Err(error) => state_of_error(&error),
         },
         Access::Lstat => match fs::symlink_metadata(path) {
             Ok(meta) if meta.file_type().is_symlink() => match fs::read_link(path) {
                 Ok(target) => State::Symlink { target },
-                Err(error) => from_error(&error),
+                Err(error) => state_of_error(&error),
             },
             Ok(meta) => describe(access, path, &meta, hasher),
-            Err(error) => from_error(&error),
+            Err(error) => state_of_error(&error),
         },
         Access::List => match read_listing(path) {
-            Ok(listing) => listing_state(path, &listing),
+            Ok(listing) => listing_state(fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()), &listing),
             Err(error) if error.raw_os_error() == Some(libc::ENOTDIR) => probe(Access::Stat, path, hasher),
-            Err(error) => from_error(&error),
+            Err(error) => state_of_error(&error),
         },
         Access::Writable => {
             State::Writable { parent_is_dir: path.parent().is_some_and(Path::is_dir), is_dir: path.is_dir() }
@@ -181,17 +181,16 @@ pub fn read_listing(dir: &Path) -> io::Result<Listing> {
         .collect()
 }
 
-pub fn listing_state(dir: &Path, listing: &Listing) -> State {
+/// The state of a directory's listing; `real_path` is the directory with
+/// symlinks resolved.
+pub fn listing_state(real_path: PathBuf, listing: &Listing) -> State {
     let mut hasher = blake3::Hasher::new();
     for (name, kind) in listing {
         hasher.update(&[kind.tag()]);
         hasher.update(&(name.len() as u64).to_le_bytes());
         hasher.update(name.as_bytes());
     }
-    State::Listing {
-        real_path: fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()),
-        entries: Digest::of_hasher(&hasher),
-    }
+    State::Listing { real_path, entries: Digest::of_hasher(&hasher) }
 }
 
 /// Files are described by content even when the command only checked their
@@ -203,13 +202,13 @@ fn describe(access: Access, path: &Path, meta: &fs::Metadata, hasher: &mut Conte
         let content = match hasher.hash_file(path) {
             Ok(content) => Some(content),
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied && access != Access::Read => None,
-            Err(error) => return from_error(&error),
+            Err(error) => return state_of_error(&error),
         };
         State::File { size: recorded_size(path, meta), mode: permission_bits(meta), content }
     } else if file_type.is_dir() {
         match fs::canonicalize(path) {
             Ok(real_path) => State::Dir { real_path, mode: permission_bits(meta) },
-            Err(error) => from_error(&error),
+            Err(error) => state_of_error(&error),
         }
     } else {
         State::Special { kind: special_kind(file_type) }
@@ -232,7 +231,7 @@ fn special_kind(file_type: FileType) -> SpecialKind {
     }
 }
 
-fn from_error(error: &io::Error) -> State {
+pub fn state_of_error(error: &io::Error) -> State {
     match error.raw_os_error() {
         Some(libc::ENOENT) => State::Missing,
         Some(errno) => State::Error { errno },

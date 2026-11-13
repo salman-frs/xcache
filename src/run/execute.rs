@@ -13,18 +13,19 @@ use crate::invocation::Invocation;
 use crate::outputs;
 use crate::record::Recorder;
 use crate::store::{RunResult, Store};
-use crate::trace::{self, Exit, Outcome};
+use crate::trace::{self, Exit, Outcome, Tracing};
 
 /// Runs the command under the tracer and captures its outputs if it can be cached.
 pub fn execute(
     invocation: &Invocation,
     store: &Store,
     hasher: &mut ContentHasher,
+    tracing: Tracing,
     console: &Console,
 ) -> Result<Execution> {
     let store_root = fs::canonicalize(store.root()).unwrap_or_else(|_| store.root().to_path_buf());
     let recorder = Recorder::new(hasher, &[store_root.as_path()]);
-    match trace::run(invocation, recorder)? {
+    match trace::run(invocation, recorder, tracing)? {
         Outcome::Unavailable { reason } => {
             console.error(format!("tracing is unavailable ({reason}); running without cache"));
             let exit_code = run_untraced(invocation)?;

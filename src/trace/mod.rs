@@ -1,7 +1,11 @@
+mod directories;
 mod filter;
 mod handle;
 pub(crate) mod net;
+mod notify;
+mod signals;
 mod spawn;
+mod supervise;
 mod syscalls;
 mod tracee;
 
@@ -10,6 +14,8 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -21,7 +27,11 @@ use crate::invocation::Invocation;
 use crate::observe::Access;
 use crate::record::{Mutation, Recorder, Recording};
 use crate::stdio;
+use crate::sync::lock;
+use directories::WorkingDirectories;
 use net::Destination;
+use notify::Listener;
+use signals::HeldSignals;
 use spawn::SetupFailure;
 
 const LEFTOVER_PROCESSES: &str = "left processes running after it exited (they were terminated)";
@@ -61,24 +71,53 @@ pub enum Outcome {
     },
 }
 
-pub fn run(invocation: &Invocation, recorder: Recorder) -> Result<Outcome> {
+/// Who sees the calls that only look at the filesystem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Tracing {
+    /// A seccomp listener where the kernel offers one, else ptrace.
+    Auto,
+    Ptrace,
+}
+
+pub fn run(invocation: &Invocation, recorder: Recorder, tracing: Tracing) -> Result<Outcome> {
     let started = Instant::now();
-    let spawn::Child { pid, stdout, stderr, setup } = spawn::spawn(invocation)?;
+    let ask_for_listener = tracing == Tracing::Auto && notify::available();
+    let spawn::Child { pid, stdout, stderr, setup } = spawn::spawn(invocation, ask_for_listener)?;
     let output = stdio::capture(stdout, stderr);
 
-    let mut tracer = Tracer::new(pid, recorder);
-    let attached = tracer.attach()?;
-    if attached {
-        tracer.run_until_all_exit()?;
-    }
+    let recorder = Mutex::new(recorder);
+    let directories = WorkingDirectories::new();
+    let mut tracer = Tracer::new(pid, &recorder, &directories);
+    let attached = match tracer.attach(ask_for_listener)? {
+        Attached::No => false,
+        Attached::Yes { listener: None } => {
+            tracer.run_until_all_exit()?;
+            true
+        }
+        Attached::Yes { listener: Some(listener) } => {
+            let (all_exited, wait_for_exit) = spawn::pipe()?;
+            thread::scope(|scope| {
+                let supervisor = thread::Builder::new()
+                    .name("xcache-supervise".into())
+                    .spawn_scoped(scope, || supervise::supervise(listener, &wait_for_exit, &recorder, &directories))
+                    .context("starting the seccomp supervisor")?;
+                let traced = tracer.run_until_all_exit();
+                drop(all_exited);
+                let supervised = supervisor.join().map_err(|_| anyhow::anyhow!("seccomp supervisor panicked"))?;
+                traced.and(supervised.context("receiving seccomp notifications"))
+            })?;
+            true
+        }
+    };
     let stdio = output.join().map_err(|_| anyhow::anyhow!("output pump panicked"))??;
     let failure = setup.failure();
 
     if attached && tracer.exec_seen {
         let command_time = started.elapsed();
-        let recording = tracer.recorder.finish();
+        let exit = tracer.root_exit.unwrap_or(Exit::Signal(libc::SIGKILL));
+        let recording = recorder.into_inner().unwrap_or_else(PoisonError::into_inner).finish();
         return Ok(Outcome::Ran(Traced {
-            exit: tracer.root_exit.unwrap_or(Exit::Signal(libc::SIGKILL)),
+            exit,
             recording,
             stdio,
             command_time,
@@ -98,16 +137,31 @@ pub fn run(invocation: &Invocation, recorder: Recorder) -> Result<Outcome> {
 struct Tracee {
     attached: bool,
     pending: Option<Pending>,
+    held: Option<HeldSignals>,
 }
 
 enum Pending {
-    Exec(PathBuf),
-    Mutations(Vec<Mutation>),
-    Rename { from: Mutation, to: Mutation },
+    Mutation(Mutation),
+    /// Either side is None when it is somewhere xcache does not record.
+    Rename {
+        from: Option<Mutation>,
+        to: Option<Mutation>,
+        renames_directories: bool,
+    },
+    DirectoryChange,
     UntracedChild,
     Accept,
-    Connect { fd: i32, destination: Destination },
-    Bind { socket: PathBuf, mutation: Option<Mutation> },
+    Connect {
+        fd: i32,
+        destination: Destination,
+    },
+    Bind {
+        socket: PathBuf,
+        mutation: Option<Mutation>,
+    },
+    BindPort {
+        fd: i32,
+    },
 }
 
 enum Resume {
@@ -115,10 +169,18 @@ enum Resume {
     UntilExit(Pending),
 }
 
-struct Tracer<'h> {
+enum Attached {
+    No,
+    Yes { listener: Option<Listener> },
+}
+
+struct Tracer<'r, 'h> {
     root: Pid,
-    recorder: Recorder<'h>,
+    recorder: &'r Mutex<Recorder<'h>>,
+    directories: &'r WorkingDirectories,
     tracees: HashMap<Pid, Tracee>,
+    /// Whether a supervisor thread sees the calls that are only observed.
+    supervised: bool,
     root_exit: Option<Exit>,
     exec_seen: bool,
     untraced_children: Vec<Pid>,
@@ -129,12 +191,14 @@ struct Tracer<'h> {
     bound_sockets: HashSet<(u64, u64)>,
 }
 
-impl<'h> Tracer<'h> {
-    fn new(root: Pid, recorder: Recorder<'h>) -> Self {
+impl<'r, 'h> Tracer<'r, 'h> {
+    fn new(root: Pid, recorder: &'r Mutex<Recorder<'h>>, directories: &'r WorkingDirectories) -> Self {
         Self {
             root,
             recorder,
+            directories,
             tracees: HashMap::new(),
+            supervised: false,
             root_exit: None,
             exec_seen: false,
             untraced_children: Vec::new(),
@@ -144,11 +208,16 @@ impl<'h> Tracer<'h> {
         }
     }
 
-    /// Returns false if the child exited before stopping, so tracing could not be set up.
-    fn attach(&mut self) -> Result<bool> {
+    fn recorder(&self) -> MutexGuard<'r, Recorder<'h>> {
+        lock(self.recorder)
+    }
+
+    /// Attaches to the child once it has stopped, taking its seccomp listener
+    /// if it has one. The child exits before that if it could not set up tracing.
+    fn attach(&mut self, asked_for_listener: bool) -> Result<Attached> {
         match wait_for(Some(self.root)).context("waiting for the command to start")? {
             Stop::Signal(_, libc::SIGSTOP) => {}
-            _ => return Ok(false),
+            _ => return Ok(Attached::No),
         }
         let options = Options::PTRACE_O_TRACESYSGOOD
             | Options::PTRACE_O_TRACEFORK
@@ -158,9 +227,15 @@ impl<'h> Tracer<'h> {
             | Options::PTRACE_O_TRACESECCOMP
             | Options::PTRACE_O_EXITKILL;
         ptrace::setoptions(self.root, options).context("PTRACE_SETOPTIONS")?;
-        self.tracees.insert(self.root, Tracee { attached: true, pending: None });
+        let listener = if asked_for_listener {
+            Listener::take_from(self.root, spawn::LISTENER_FD).context("taking the seccomp listener")?
+        } else {
+            None
+        };
+        self.supervised = listener.is_some();
+        self.tracees.insert(self.root, Tracee { attached: true, ..Tracee::default() });
         ptrace::cont(self.root, None).context("resuming the command")?;
-        Ok(true)
+        Ok(Attached::Yes { listener })
     }
 
     fn run_until_all_exit(&mut self) -> Result<()> {
@@ -178,14 +253,15 @@ impl<'h> Tracer<'h> {
                 Stop::Exited(pid, code) => self.exited(pid, Exit::Code(code)),
                 Stop::Killed(pid, signal) => self.exited(pid, Exit::Signal(signal)),
                 Stop::Event(pid, event) => self.ptrace_event(pid, event),
-                Stop::Syscall(pid) => self.syscall_exit(pid),
+                Stop::Syscall(pid) => self.syscall_stop(pid),
                 Stop::Signal(pid, signal) => self.signal_stop(pid, signal),
             }
         }
     }
 
     fn exited(&mut self, pid: Pid, exit: Exit) {
-        if let Some(pending @ (Pending::Mutations(_) | Pending::Rename { .. })) =
+        self.directories.forget(pid);
+        if let Some(pending @ (Pending::Mutation(_) | Pending::Rename { .. })) =
             self.tracees.remove(&pid).and_then(|tracee| tracee.pending)
         {
             // The syscall may have completed without an exit stop (exit_group or
@@ -199,7 +275,7 @@ impl<'h> Tracer<'h> {
         let mut leftovers: Vec<Pid> = self.tracees.keys().copied().filter(|pid| is_running(*pid)).collect();
         leftovers.extend(self.untraced_children.iter().copied().filter(|pid| is_running(*pid)));
         if !leftovers.is_empty() {
-            self.recorder.taint(LEFTOVER_PROCESSES);
+            self.recorder().taint(LEFTOVER_PROCESSES);
             for pid in leftovers {
                 let _ = signal::kill(pid, Signal::SIGKILL);
             }
@@ -216,22 +292,10 @@ impl<'h> Tracer<'h> {
         let (Some(pid), Some(_)) = (still_running, self.root_exit) else {
             return false;
         };
-        self.recorder.taint(LEFTOVER_PROCESSES);
+        self.recorder().taint(LEFTOVER_PROCESSES);
         let _ = signal::kill(pid, Signal::SIGKILL);
         resume(pid, NO_SIGNAL);
         true
-    }
-
-    fn signal_stop(&mut self, pid: Pid, signal: i32) {
-        let tracee = self.tracees.entry(pid).or_default();
-        if signal == libc::SIGSTOP && !tracee.attached {
-            tracee.attached = true;
-            resume(pid, NO_SIGNAL);
-            return;
-        }
-        let is_group_stop = matches!(signal, libc::SIGSTOP | libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU)
-            && ptrace::getsiginfo(pid).is_err();
-        resume(pid, if is_group_stop { NO_SIGNAL } else { signal });
     }
 
     fn ptrace_event(&mut self, pid: Pid, event: i32) {
@@ -260,18 +324,24 @@ impl<'h> Tracer<'h> {
             e if e == Event::PTRACE_EVENT_EXEC as i32 => {
                 self.exec_seen = true;
                 let former = ptrace::getevent(pid).map(|tid| Pid::from_raw(tid as i32)).unwrap_or(pid);
-                let pending = self.tracees.get_mut(&former).and_then(|tracee| tracee.pending.take());
+                let held = self.tracees.get_mut(&former).and_then(|tracee| tracee.held.take());
                 if former != pid {
                     self.tracees.remove(&former);
+                    self.directories.forget(former);
                 }
-                self.tracees.entry(pid).or_default().attached = true;
-                if let Some(Pending::Exec(path)) = pending {
-                    self.recorder.observe(Access::Read, &path);
-                }
+                let tracee = self.tracees.entry(pid).or_default();
+                tracee.attached = true;
+                tracee.held = held.filter(HeldSignals::are_waiting);
+                let mut recorder = self.recorder();
                 for file in tracee::mapped_files(pid) {
-                    self.recorder.observe(Access::Read, &file);
+                    recorder.observe(Access::Read, &file);
                 }
-                resume(pid, NO_SIGNAL);
+                drop(recorder);
+                if self.tracees[&pid].held.is_some() {
+                    self.resend_held_signals(pid);
+                } else {
+                    resume(pid, NO_SIGNAL);
+                }
             }
             _ => resume(pid, NO_SIGNAL),
         }
@@ -288,32 +358,39 @@ impl<'h> Tracer<'h> {
     fn complete(&mut self, pending: Pending, result: i64, pid: Pid) {
         let succeeded = result >= 0;
         match pending {
-            Pending::Exec(path) => self.recorder.observe(Access::Read, &path),
-            Pending::Mutations(mutations) if succeeded => {
-                for mutation in mutations {
-                    self.recorder.mutated(mutation);
+            Pending::Mutation(mutation) if succeeded => self.recorder().mutated(mutation),
+            Pending::Rename { from, to, renames_directories } if succeeded => {
+                if renames_directories {
+                    self.directories.may_have_changed();
+                }
+                let mut recorder = self.recorder();
+                match (from, to) {
+                    (Some(from), Some(to)) => recorder.renamed(from, to),
+                    (from, to) => from.into_iter().chain(to).for_each(|mutation| recorder.mutated(mutation)),
                 }
             }
-            Pending::Rename { from, to } if succeeded => self.recorder.renamed(from, to),
+            Pending::DirectoryChange => self.directories.may_have_changed(),
             Pending::UntracedChild if result > 0 => self.untraced_children.push(Pid::from_raw(result as i32)),
             Pending::Accept if result >= 0 => {
                 let tracees: Vec<Pid> = self.tracees.keys().copied().collect();
                 if let Some(reason) =
                     net::accepted_from_outside(pid, result as i32, &tracees, &mut self.opened_connections)
                 {
-                    self.recorder.taint(reason);
+                    self.recorder().taint(reason);
                 }
             }
             Pending::Connect { fd, destination } => self.connected(pid, fd, &destination, result),
             Pending::Bind { socket, mutation } if succeeded => {
                 if let Some(mutation) = mutation {
-                    self.recorder.mutated(mutation);
+                    self.recorder().mutated(mutation);
                 }
                 if let Ok(meta) = std::fs::metadata(&socket) {
                     self.bound_sockets.insert((meta.dev(), meta.ino()));
                 }
             }
-            Pending::Mutations(_)
+            Pending::BindPort { fd } if succeeded => self.known_listeners.bound(pid, fd),
+            Pending::Mutation(_)
+            | Pending::BindPort { .. }
             | Pending::Rename { .. }
             | Pending::UntracedChild
             | Pending::Accept

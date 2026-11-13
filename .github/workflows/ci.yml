@@ -36,6 +36,10 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      - name: cargo test with every call stopping in ptrace
+        run: cargo test --locked
+        env:
+          XCACHE_TRACER: ptrace
 
   msrv:
     name: minimum Rust version

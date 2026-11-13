@@ -27,7 +27,7 @@ the command reads under `/proc`, `/sys` and `/dev`. xcache doesn't track those.
 | `cli.rs` | Command line and exit statuses |
 | `run/` | The `run` and `explain` commands: lookup and restore (`mod.rs`), running a miss (`execute.rs`), shadow mode (`shadow.rs`) and the `--report` JSON (`report.rs`) |
 | `invocation.rs` | The fingerprint of a command line, working directory and environment |
-| `trace/` | The tracer: starting the command (`spawn.rs`), the seccomp filter (`filter.rs`), decoding system calls (`syscalls.rs`), what each one records (`handle.rs`), reading the tracee's memory (`tracee.rs`) and checking sockets (`net.rs`) |
+| `trace/` | The tracer: starting the command (`spawn.rs`), the seccomp filter (`filter.rs`), decoding system calls (`syscalls.rs`), the calls that only read and the supervisor thread that records them (`supervise.rs`, `notify.rs`), the calls that stop in ptrace (`handle.rs`), signals (`signals.rs`), reading the tracee's memory (`tracee.rs`), working directories (`directories.rs`) and checking sockets (`net.rs`) |
 | `record.rs` | Turning system calls into inputs and outputs |
 | `observe.rs` | Kinds of access, the state each records, and probing a path's current state |
 | `git.rs` | Digests of git's index and reflogs |
@@ -36,6 +36,7 @@ the command reads under `/proc`, `/sys` and `/dev`. xcache doesn't track those.
 | `store.rs` | The cache directory and the entries in it |
 | `digest.rs` | Content digests and the stat cache |
 | `path_serde.rs` | Paths that are not UTF-8 in JSON |
+| `sync.rs` | Running work on all CPUs |
 
 ## Lookup
 
@@ -111,8 +112,12 @@ lookup sees the change. Paths under `/proc` are resolved first, because
 
 Hashing each file when it is opened would stall the command. Instead, a read
 or `stat` of a file records its device, inode, size, mtime and ctime, and the
-content is hashed after the command exits. If those have changed by then,
-another process modified the file during the run, and the result is not stored.
+content is hashed without the command waiting for it: by threads at the lowest
+priority while the command runs, and on all CPUs for whatever is left when it
+exits (`digest.rs`). A digest counts only if the file still has the recorded
+device, inode, size and times when the command has exited. If those have
+changed, another process modified the file during the run, and the result is
+not stored.
 
 If the command itself writes to a file it read earlier, the pending hash is
 computed before the write goes through, so the recorded content is what the
@@ -199,48 +204,120 @@ instead.
 1. connects stdin to `/dev/null`;
 2. connects stdout and stderr to pipes, which xcache forwards and records;
 3. closes all other inherited file descriptors;
-4. calls `PTRACE_TRACEME` and stops itself so the parent can set ptrace
-   options;
-5. sets `no_new_privs` and installs the seccomp filter;
+4. sets `no_new_privs` and installs the seccomp filter, with a listener for
+   user notifications if the kernel gives it one;
+5. calls `PTRACE_TRACEME` and stops itself, so the parent can set ptrace
+   options and copy the listener out with `pidfd_getfd`;
 6. calls `execve` on each `PATH` candidate in turn. The failed attempts are
    traced, so they show up as missing paths.
 
-The child does not allocate after the fork. The `argv` and `envp` arrays are
-built before it.
+The child does not allocate after the fork. The `argv` and `envp` arrays, and
+both filters, are built before it.
 
 ### Seccomp filter
 
-`trace/filter.rs` builds a classic BPF program:
+`trace/filter.rs` builds a classic BPF program from the rules in
+`trace/syscalls.rs`:
 
 1. System calls through a foreign ABI (`int 0x80` or x32 on x86_64) go to the
    tracer, which marks the run uncacheable.
 2. `io_uring_setup`, `io_uring_enter` and `io_uring_register` fail with
    `ENOSYS`, because io_uring can read files without a system call per
    file. Most programs that get `ENOSYS` fall back to normal calls.
-3. The filesystem calls, plus `connect`, `sendto`, `sendmsg`, `accept`,
-   `clone`, `unshare` and the mount calls, stop in the tracer. x86_64 also
-   has `open`, `stat` and the other calls without `at`. `trace/syscalls.rs`
-   lists them.
-4. Everything else runs without stopping.
+3. Calls that only look at the filesystem go to the supervisor: `openat`
+   without write access, creation or truncation, the `stat`, `access` and
+   `readlink` calls, `getdents64` and `execve`.
+4. The other filesystem calls, plus `chdir`, `connect`, `sendto`, `sendmsg`,
+   `accept`, `clone3`, `unshare` and the mount calls, stop in the tracer, and
+   so does `clone` with namespace flags or `CLONE_UNTRACED`. x86_64 also has
+   `open`, `stat` and the other calls without `at`.
+5. Everything else runs without stopping.
 
-### Handling a stop
+Builds make far more calls of the first kind: in the corpus steps that were
+profiled, 86% to 99% of the calls the filter catches are reads and probes.
 
+### Handling a call
+
+Reads and probes are seccomp user notifications (`trace/notify.rs`). A
+supervisor thread receives each one, reads the path arguments with
+`process_vm_readv`, one page at a time (`trace/tracee.rs`), resolves them
+against the caller's working directory or descriptor while the caller waits,
+records the paths, and lets the call continue (`trace/supervise.rs`). If the
+caller was interrupted in the meantime the call arrives again, and what was
+recorded for the first one is at worst an input the command never read.
+
+Since Linux 6.6 the kernel can wake the supervisor on the CPU of the caller
+and the caller on the CPU of the supervisor. That is what makes a notification
+cheap: waking a thread on another CPU costs an interrupt, and several times
+more in a virtual machine when that CPU is idle. In a loop of `stat` and
+`open` calls in a 4-CPU VM, a ptrace stop takes about 30 microseconds and a
+notification about 4. A caller that wakes the sleeping supervisor
+brings it to its own CPU and continues there. One that arrives while the
+supervisor is busy is usually on another CPU, and waking it on the
+supervisor's would move it there, until a parallel build ran on one CPU. So
+the supervisor remembers on which CPU it met each caller, and only wakes
+those it met on its current one that way.
+
+Every other call stops in the tracer (`trace/handle.rs`).
 `PTRACE_GET_SYSCALL_INFO` gives the system call number and arguments without
-reading registers, so the same code works on both architectures. Path
-arguments are read with `process_vm_readv`, one page at a time
-(`trace/tracee.rs`).
+reading registers, so the same code works on both architectures. These calls
+stop again when they return, because the result decides what gets recorded:
+writes are only recorded if they succeeded, `accept` returns the connection
+whose peer has to be checked, and `clone` with `CLONE_UNTRACED` returns the
+process that has to be killed at the end. An `execve` is recorded as a read of
+its path when it starts, which is a missing path if it fails.
 
-Reads and probes are recorded when the call starts, and the process continues
-right away (`trace/handle.rs`). A few calls also stop when they return,
-because the result decides what gets recorded: writes are only recorded if
-they succeeded, a failed `execve` is recorded as a missing path, `accept`
-returns the connection whose peer has to be checked, and `clone` with
-`CLONE_UNTRACED` returns the process that has to be killed at the end.
+The supervisor and the tracer share the recorder. A call is recorded before it
+runs in both, so a read that comes before a write in the command is recorded
+before the write.
+
+The kernel only gives a listener to a process that doesn't already run under
+one, and copying it out takes `pidfd_getfd`, which came in Linux 5.6 and which
+Docker's default seccomp profile refuses without `CAP_SYS_PTRACE`. xcache
+tries it on one of its own descriptors before it asks for a listener
+(`notify.rs`, `available`). Without one, or with `--tracer ptrace`, the reads
+and probes stop in the tracer too, and record the same inputs.
+
+Like ptrace, the supervisor reads arguments the caller's other threads could
+still change before the kernel reads them again. The tracer records what a
+program shows it; it is not a sandbox.
+
+Most of what a stop costs beyond the wake-ups was the tracer looking things
+up, so it remembers what does not change between calls:
+
+- A process's working directory is read from `/proc` once, and again after a
+  `chdir`, an `fchdir`, or a rename of a directory (`trace/directories.rs`).
+- A directory's real path is resolved once, until the command removes or
+  replaces a directory or a symlink (`record.rs`, `real_dir`). Only
+  directories are remembered, because replacing a file with a symlink is
+  neither.
+- One `lstat` of a path serves the checks for ownership, for links into
+  `/proc`, and for the state that is recorded.
+
+### Signals
+
+A signal can interrupt a call while it waits for the supervisor. If the
+handler was installed without `SA_RESTART`, as dash installs its `SIGCHLD`
+handler, the call would fail with `EINTR`, which a `stat` or an `open` of a
+local file never does otherwise. The kernel defers signals once the
+supervisor has received a call (`SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV`,
+Linux 5.19), but not before.
+
+The tracer covers the rest, because every signal stops in ptrace before its
+handler runs (`trace/signals.rs`). If the thread is about to restart a call
+the supervisor sees, the signal interrupted it before it ran: the result still
+reads `-ERESTARTSYS` on x86_64, and on aarch64 the kernel has already moved
+the program counter back to the `svc`. The tracer then holds the signal back,
+lets the call run again, and sends the signal anew once the call has
+returned, restoring its original `siginfo` when it is delivered. Opening a
+FIFO or a device can block in the call itself, where a signal has to
+interrupt it, so those are left alone.
 
 ### Processes
 
-New processes and threads are traced automatically. An `execve` from a thread
-other than the leader is matched with the call that thread started. When the
+New processes and threads are traced automatically. The seccomp filter, and
+with it the listener, is inherited across `fork` and kept across `execve`, so
+notifications come from every process of the command. When the
 root process exits, any traced process still running is killed and the result
 is not stored; this includes processes whose fork event was still queued. If a
 process dies in the middle of a write, the write is recorded anyway, and
@@ -252,8 +329,10 @@ capturing the outputs shows what actually happened.
 
 - a non-loopback address makes the run uncacheable;
 - a loopback port or Unix socket is allowed only if the socket on the other
-  end belongs to a traced process, which is checked with `/proc/<pid>/net/*`
-  and the processes' file descriptors;
+  end belongs to a traced process. The tracer notes the loopback ports the
+  command binds and asks the kernel about a copy of the socket
+  (`pidfd_getfd`); what that doesn't answer is looked up in
+  `/proc/<pid>/net/*` and the processes' file descriptors;
 - a connection that reaches nothing is an input instead: a socket path with
   no file is a missing path, and a refused loopback port, or a datagram socket
   connected to a port nothing is bound to, is a `listen` input. glibc's
@@ -311,11 +390,29 @@ blobs that no remaining entry uses, and deletes stat caches from other boots.
 
 ## Open problems
 
-- Overhead. Every traced call waits for a round trip to the tracer. A tracer
-  built on seccomp user notifications (branch `perf/seccomp-unotify`) was no
-  faster than ptrace on GitHub's runners: +26.5% against +26.0% median on a
-  miss in an [A/B benchmark](https://github.com/salman-frs/xcache/actions/runs/43042700975).
-  Less than 10% needs recording accesses without stopping the command, as
-  fanotify or eBPF could.
+- Overhead. A read or probe is a round trip to the supervisor, which is one
+  thread: callers on other CPUs wait for it and are woken across CPUs. Writes,
+  new processes, `execve` and signals still stop in ptrace. In a 4-CPU aarch64
+  VM the median miss overhead of eight corpus projects, from fresh checkouts,
+  went from +48% to +14% with the supervisor, the remembered lookups, early
+  hashing and parallel storing together: none that could be measured for
+  anyhow and commander, +10% to +15% for click, testify and koa, +27% for
+  uuid, +39% for markupsafe and +79% for zlib. The corpus has not been run on
+  GitHub's runners since.
+
+  Steps that are mostly path lookups stay expensive. In zlib's test step the
+  supervisor spends about 5 microseconds on each of 72,000 notifications,
+  three quarters of it in the kernel: two `ioctl` calls, a `poll` and a
+  `process_vm_readv`. Only 5,400 of those lookups name a path that is not
+  recorded yet, and dropping the repeats before they reach xcache takes code
+  in the kernel, as eBPF allows, or in the process. Having the tracer wait
+  actively instead of sleeping cut a ptrace stop from 30 to 9 microseconds in
+  a loop of calls and changed nothing in these steps, where the other CPUs
+  are busy anyway.
+
+  An earlier supervisor that always woke callers on its own CPU was no faster
+  than ptrace on GitHub's runners (+26.5% against +26.0% median in an
+  [A/B benchmark](https://github.com/salman-frs/xcache/actions/runs/43042700975)),
+  because parallel steps ended up on one CPU.
 - The clock and randomness can't be observed without kernel changes. Shadow
   mode shows how much they matter for a project but doesn't fix them.

@@ -1,6 +1,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
+use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -50,6 +52,13 @@ pub struct Mutation {
     before: Option<EntryKind>,
 }
 
+impl Mutation {
+    /// Whether the path was a directory before the call.
+    pub fn is_of_a_directory(&self) -> bool {
+        self.before == Some(EntryKind::Dir)
+    }
+}
+
 enum Recorded {
     Known(State),
     /// A regular file whose content is hashed when the command finishes,
@@ -88,12 +97,15 @@ pub struct Recorder<'h> {
     hasher: &'h mut ContentHasher,
     excluded: Vec<PathBuf>,
     observations: Vec<Observation>,
-    seen: HashMap<Access, HashSet<PathBuf>>,
+    seen: HashMap<Access, HashSet<OsString>>,
     deferred_by_path: HashMap<PathBuf, Vec<usize>>,
     deferred_by_inode: HashMap<(u64, u64), Vec<usize>>,
     owned_paths: HashSet<PathBuf>,
     owned_inodes: HashSet<(u64, u64)>,
-    owned_trees: Vec<PathBuf>,
+    owned_trees: HashSet<PathBuf>,
+    /// Directories by the path they resolve to, until the command changes a
+    /// directory or symlink.
+    real_dirs: HashMap<PathBuf, PathBuf>,
     outputs: BTreeSet<PathBuf>,
     preexisting_outputs: BTreeSet<PathBuf>,
     output_trees: BTreeSet<PathBuf>,
@@ -115,7 +127,8 @@ impl<'h> Recorder<'h> {
             deferred_by_inode: HashMap::new(),
             owned_paths: HashSet::new(),
             owned_inodes: HashSet::new(),
-            owned_trees: Vec::new(),
+            owned_trees: HashSet::new(),
+            real_dirs: HashMap::new(),
             outputs: BTreeSet::new(),
             preexisting_outputs: BTreeSet::new(),
             output_trees: BTreeSet::new(),
@@ -141,19 +154,21 @@ impl<'h> Recorder<'h> {
     /// Called before the kernel performs a mutation, while the command is
     /// stopped, so the pre-mutation state can still be captured.
     pub fn before_mutation(&mut self, requested: &Path, effect: Effect) -> Option<Mutation> {
-        let mut path = real_location(requested);
-        if effect.follows_symlinks() && fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_symlink()) {
+        let mut path = self.real_location(requested);
+        let mut entry = fs::symlink_metadata(&path);
+        if effect.follows_symlinks() && is_symlink(&entry) {
             self.record_observation(Access::Lstat, &path, true);
-            path = resolve_symlinks(&path);
+            path = self.resolve_symlinks(&path);
+            entry = fs::symlink_metadata(&path);
         }
         let path = path.as_path();
         if self.is_excluded(path) {
             return None;
         }
-        self.settle_deferred_observations_of(path);
-        let before = fs::symlink_metadata(path).ok().map(|meta| EntryKind::of(meta.file_type()));
+        self.settle_deferred_observations_of(path, &entry);
+        let before = entry.as_ref().ok().map(|meta| EntryKind::of(meta.file_type()));
 
-        if !self.is_owned(path) {
+        if !self.is_owned(path, &entry) {
             let access = match (effect, before) {
                 (Effect::RenameFrom, Some(EntryKind::Dir)) => {
                     self.taint(format!("renames a directory it did not create: {}", path.display()));
@@ -186,14 +201,15 @@ impl<'h> Recorder<'h> {
     /// Setting a file's times leaves its content alone but changes the identity
     /// that deferred hashing checks, so what was observed is hashed first.
     pub fn before_times_change(&mut self, path: &Path, follows_symlinks: bool) {
-        let path = real_location(path);
-        let path = if follows_symlinks { resolve_symlinks(&path) } else { path };
-        self.settle_deferred_observations_of(&path);
+        let path = self.real_location(path);
+        let path = if follows_symlinks { self.resolve_symlinks(&path) } else { path };
+        self.settle_deferred_observations_of(&path, &fs::symlink_metadata(&path));
     }
 
     /// Linking changes the source's ctime, so its content is captured first.
     pub fn before_link(&mut self, source: &Path) {
-        self.settle_deferred_observations_of(&real_location(source));
+        let real = self.real_location(source);
+        self.settle_deferred_observations_of(&real, &fs::symlink_metadata(&real));
         self.record_observation(Access::Lstat, source, true);
         self.record_observation(Access::Read, source, true);
     }
@@ -201,6 +217,9 @@ impl<'h> Recorder<'h> {
     /// Called after the kernel reported that the mutation succeeded.
     pub fn mutated(&mut self, mutation: Mutation) {
         let Mutation { path, effect, parent, name, before } = mutation;
+        if changes_where_paths_lead(effect, before) {
+            self.real_dirs.clear();
+        }
         if effect == Effect::SetTimes {
             self.dated_outputs.insert(path.clone());
         } else {
@@ -223,7 +242,7 @@ impl<'h> Recorder<'h> {
                 self.owned_inodes.insert((meta.dev(), meta.ino()));
             }
             if effect == Effect::MakeNode && is_dir && before.is_none() {
-                self.owned_trees.push(path.clone());
+                self.owned_trees.insert(path.clone());
             }
             self.owned_paths.insert(path);
         }
@@ -242,7 +261,7 @@ impl<'h> Recorder<'h> {
             self.dated_outputs.insert(destination.clone());
         }
         if moved_directory {
-            self.owned_trees.push(destination.clone());
+            self.owned_trees.insert(destination.clone());
             self.output_trees.insert(destination);
         }
     }
@@ -278,10 +297,10 @@ impl<'h> Recorder<'h> {
     }
 
     fn record_observation(&mut self, access: Access, requested: &Path, hash_now: bool) {
-        if self.seen.get(&access).is_some_and(|paths| paths.contains(requested)) {
+        if self.seen.get(&access).is_some_and(|paths| paths.contains(requested.as_os_str())) {
             return;
         }
-        self.seen.entry(access).or_default().insert(requested.to_path_buf());
+        self.seen.entry(access).or_default().insert(requested.as_os_str().to_owned());
         if access == Access::Listen {
             let state = observe::probe(access, requested, self.hasher);
             self.observations.push(Observation {
@@ -291,12 +310,13 @@ impl<'h> Recorder<'h> {
             });
             return;
         }
-        let real = real_location(requested);
-        if self.is_excluded(&real) || self.is_owned(&real) {
+        let real = self.real_location(requested);
+        let entry = fs::symlink_metadata(&real);
+        if self.is_excluded(&real) || self.is_owned(&real, &entry) {
             return;
         }
-        if leads_to_machine_state(access, &real) {
-            for link in symlink_chain(&real) {
+        if leads_to_machine_state(access, &real, &entry) {
+            for link in self.symlink_chain(&real) {
                 self.record_observation(Access::Lstat, &link, true);
             }
             return;
@@ -304,13 +324,23 @@ impl<'h> Recorder<'h> {
         // Paths under /proc name the tracee (cwd, fd links); record where they lead.
         let path = if requested.starts_with("/proc") { real.as_path() } else { requested };
 
+        let real_is_what_access_finds = !is_symlink(&entry);
         let recorded = match access {
-            Access::Read | Access::Stat | Access::Lstat if !hash_now => match observe::metadata(access, path) {
-                Ok(meta) if meta.is_file() => Recorded::Deferred(Identity::of(&meta)),
-                _ => Recorded::Known(observe::probe(access, path, self.hasher)),
+            Access::Read | Access::Stat | Access::Lstat => match what_access_finds(access, path, entry) {
+                Ok(meta) if meta.is_file() && !hash_now => {
+                    if !self.deferred_by_inode.contains_key(&(meta.dev(), meta.ino())) {
+                        self.hasher.hash_early(path, &meta);
+                    }
+                    Recorded::Deferred(Identity::of(&meta))
+                }
+                Ok(meta) if meta.is_dir() && real_is_what_access_finds => {
+                    Recorded::Known(State::Dir { real_path: real.clone(), mode: observe::permission_bits(&meta) })
+                }
+                Ok(_) => Recorded::Known(observe::probe(access, path, self.hasher)),
+                Err(error) => Recorded::Known(observe::state_of_error(&error)),
             },
             Access::List => Recorded::Known(self.listing_before_run(path)),
-            _ => Recorded::Known(observe::probe(access, path, self.hasher)),
+            Access::Writable | Access::Listen => Recorded::Known(observe::probe(access, path, self.hasher)),
         };
 
         let index = self.observations.len();
@@ -331,12 +361,18 @@ impl<'h> Recorder<'h> {
         if let Some(removed) = self.removed.get(dir) {
             listing.extend(removed.iter().map(|(name, kind)| (name.clone(), *kind)));
         }
-        observe::listing_state(dir, &listing)
+        let real_path = self.real_dir(dir).unwrap_or_else(|| dir.to_path_buf());
+        observe::listing_state(real_path, &listing)
     }
 
-    fn settle_deferred_observations_of(&mut self, path: &Path) {
+    /// `entry` is what is at `path`, without following a symlink there.
+    fn settle_deferred_observations_of(&mut self, path: &Path, entry: &io::Result<fs::Metadata>) {
+        if self.deferred_by_inode.is_empty() {
+            return;
+        }
         let mut indexes: Vec<usize> = self.deferred_by_path.get(path).cloned().unwrap_or_default();
-        for meta in [fs::metadata(path), fs::symlink_metadata(path)].into_iter().flatten() {
+        let target = if is_symlink(entry) { fs::metadata(path).ok() } else { None };
+        for meta in entry.iter().chain(&target) {
             if let Some(same_inode) = self.deferred_by_inode.get(&(meta.dev(), meta.ino())) {
                 indexes.extend(same_inode);
             }
@@ -378,66 +414,114 @@ impl<'h> Recorder<'h> {
         is_machine_state(real) || self.excluded.iter().any(|excluded| real.starts_with(excluded))
     }
 
-    fn is_owned(&self, real: &Path) -> bool {
-        self.owned_paths.contains(real)
-            || self.owned_trees.iter().any(|tree| real.starts_with(tree))
-            || fs::metadata(real).is_ok_and(|meta| self.owned_inodes.contains(&(meta.dev(), meta.ino())))
+    /// `entry` is what is at `real`, without following a symlink there.
+    fn is_owned(&self, real: &Path, entry: &io::Result<fs::Metadata>) -> bool {
+        if self.owned_paths.contains(real) {
+            return true;
+        }
+        if !self.owned_trees.is_empty() && real.ancestors().any(|ancestor| self.owned_trees.contains(ancestor)) {
+            return true;
+        }
+        if self.owned_inodes.is_empty() {
+            return false;
+        }
+        let is_owned_inode = |meta: &fs::Metadata| self.owned_inodes.contains(&(meta.dev(), meta.ino()));
+        match entry {
+            Ok(link) if link.is_symlink() => fs::metadata(real).is_ok_and(|target| is_owned_inode(&target)),
+            Ok(meta) => is_owned_inode(meta),
+            Err(_) => false,
+        }
     }
+
+    /// The symlinks a path goes through, up to the first target outside them.
+    fn symlink_chain(&mut self, link: &Path) -> Vec<PathBuf> {
+        let mut chain = Vec::new();
+        let mut path = link.to_path_buf();
+        while chain.len() < 40 && !is_machine_state(&path) {
+            let Ok(target) = fs::read_link(&path) else {
+                break;
+            };
+            let next = self.real_location(&path.parent().unwrap_or(Path::new("/")).join(target));
+            chain.push(path);
+            path = next;
+        }
+        chain
+    }
+
+    /// Where a path really lives: its parent directory with symlinks and `..`
+    /// resolved, so lexical prefixes cannot alias another directory. Magic links
+    /// under /proc are followed through to their target.
+    fn real_location(&mut self, path: &Path) -> PathBuf {
+        if path.starts_with("/proc")
+            && let Ok(real) = fs::canonicalize(path)
+        {
+            return real;
+        }
+        match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => match self.real_dir(parent) {
+                Some(real) => real.join(name),
+                None => path.to_path_buf(),
+            },
+            _ => fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+        }
+    }
+
+    fn real_dir(&mut self, dir: &Path) -> Option<PathBuf> {
+        if let Some(real) = self.real_dirs.get(dir) {
+            return Some(real.clone());
+        }
+        let real = fs::canonicalize(dir).ok()?;
+        // A file can be replaced by a symlink without `real_dirs` being cleared.
+        if real.is_dir() {
+            self.real_dirs.insert(dir.to_path_buf(), real.clone());
+        }
+        Some(real)
+    }
+
+    fn resolve_symlinks(&mut self, link: &Path) -> PathBuf {
+        let mut path = link.to_path_buf();
+        for _ in 0..40 {
+            let Ok(target) = fs::read_link(&path) else {
+                break;
+            };
+            path = self.real_location(&path.parent().unwrap_or(Path::new("/")).join(target));
+        }
+        path
+    }
+}
+
+fn is_symlink(entry: &io::Result<fs::Metadata>) -> bool {
+    entry.as_ref().is_ok_and(fs::Metadata::is_symlink)
+}
+
+/// What a call with this access finds at `path`, given the `entry` there: the
+/// entry itself, unless it is a symlink the call follows.
+fn what_access_finds(access: Access, path: &Path, entry: io::Result<fs::Metadata>) -> io::Result<fs::Metadata> {
+    match entry {
+        Ok(link) if link.is_symlink() && access != Access::Lstat => fs::metadata(path),
+        entry => entry,
+    }
+}
+
+/// Removing or replacing a directory or symlink changes what the paths
+/// through it resolve to. Nothing resolved through a path that did not exist.
+fn changes_where_paths_lead(effect: Effect, before: Option<EntryKind>) -> bool {
+    matches!(effect, Effect::Remove | Effect::RemoveDir | Effect::RenameFrom | Effect::RenameTo)
+        && matches!(before, Some(EntryKind::Dir | EntryKind::Symlink))
 }
 
 /// A symlink such as /etc/mtab can lead into /proc, which is machine state.
-fn leads_to_machine_state(access: Access, real: &Path) -> bool {
+fn leads_to_machine_state(access: Access, real: &Path, entry: &io::Result<fs::Metadata>) -> bool {
     let follows_symlinks = matches!(access, Access::Read | Access::Stat);
-    follows_symlinks
-        && fs::symlink_metadata(real).is_ok_and(|meta| meta.is_symlink())
-        && fs::canonicalize(real).is_ok_and(|target| is_machine_state(&target))
-}
-
-/// The symlinks a path goes through, up to the first target outside them.
-fn symlink_chain(link: &Path) -> Vec<PathBuf> {
-    let mut chain = Vec::new();
-    let mut path = link.to_path_buf();
-    while chain.len() < 40 && !is_machine_state(&path) {
-        let Ok(target) = fs::read_link(&path) else {
-            break;
-        };
-        let next = real_location(&path.parent().unwrap_or(Path::new("/")).join(target));
-        chain.push(path);
-        path = next;
-    }
-    chain
+    follows_symlinks && is_symlink(entry) && fs::canonicalize(real).is_ok_and(|target| is_machine_state(&target))
 }
 
 fn is_machine_state(real: &Path) -> bool {
-    real.starts_with("/proc") || real.starts_with("/sys") || (real.starts_with("/dev") && !real.starts_with("/dev/shm"))
-}
-
-/// Where a path really lives: its parent directory with symlinks and `..`
-/// resolved, so lexical prefixes cannot alias another directory. Magic links
-/// under /proc are followed through to their target.
-fn real_location(path: &Path) -> PathBuf {
-    if path.starts_with("/proc")
-        && let Ok(real) = fs::canonicalize(path)
-    {
-        return real;
-    }
-    match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) => {
-            fs::canonicalize(parent).map_or_else(|_| path.to_path_buf(), |real| real.join(name))
-        }
-        _ => fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
-    }
-}
-
-fn resolve_symlinks(link: &Path) -> PathBuf {
-    let mut path = link.to_path_buf();
-    for _ in 0..40 {
-        let Ok(target) = fs::read_link(&path) else {
-            break;
-        };
-        path = real_location(&path.parent().unwrap_or(Path::new("/")).join(target));
-    }
-    path
+    let could_be = matches!(real.as_os_str().as_bytes().get(1), Some(b'p' | b's' | b'd' | b'/' | b'.'));
+    could_be
+        && (real.starts_with("/proc")
+            || real.starts_with("/sys")
+            || (real.starts_with("/dev") && !real.starts_with("/dev/shm")))
 }
 
 #[cfg(test)]
