@@ -44,6 +44,17 @@ fn creating_namespaces_is_not_cached() {
     assert!(run.reasons().contains("namespaces"), "{}", run.reasons());
 }
 
+#[test]
+fn a_process_whose_memory_cannot_be_read_is_not_cached() {
+    let ws = Workspace::new();
+    ws.write("input.txt", "a");
+    let script = "import ctypes\nPR_SET_DUMPABLE = 4\nctypes.CDLL(None).prctl(PR_SET_DUMPABLE, 0)\nprint(open('input.txt').read())";
+    let run = ws.run(&["python3", "-c", script]);
+    assert_eq!(run.stdout, "a\n", "{}", run.stderr);
+    assert_outcome(&run, "not_cached");
+    assert!(run.reasons().contains("memory cannot be read"), "{}", run.reasons());
+}
+
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn system_calls_through_the_32_bit_abi_are_not_cached() {

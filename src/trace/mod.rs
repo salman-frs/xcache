@@ -35,6 +35,7 @@ use signals::HeldSignals;
 use spawn::SetupFailure;
 
 const LEFTOVER_PROCESSES: &str = "left processes running after it exited (they were terminated)";
+const HIDDEN_MEMORY: &str = "has a process whose memory cannot be read, so its system calls went unrecorded";
 const NO_SIGNAL: i32 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,10 +116,13 @@ pub fn run(invocation: &Invocation, recorder: Recorder, tracing: Tracing) -> Res
     if attached && tracer.exec_seen {
         let command_time = started.elapsed();
         let exit = tracer.root_exit.unwrap_or(Exit::Signal(libc::SIGKILL));
-        let recording = recorder.into_inner().unwrap_or_else(PoisonError::into_inner).finish();
+        let mut recorder = recorder.into_inner().unwrap_or_else(PoisonError::into_inner);
+        if tracee::memory_was_hidden() {
+            recorder.taint(HIDDEN_MEMORY);
+        }
         return Ok(Outcome::Ran(Traced {
             exit,
-            recording,
+            recording: recorder.finish(),
             stdio,
             command_time,
             hashing_time: started.elapsed() - command_time,

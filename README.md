@@ -126,6 +126,9 @@ A command still runs normally, but its result is not stored, when it:
 - leaves processes running after it exits (xcache kills them);
 - creates namespaces, mounts filesystems, or calls `chroot`;
 - renames a directory it didn't create;
+- has a process whose memory xcache may not read, such as one that calls
+  `prctl(PR_SET_DUMPABLE, 0)`, because the paths in its system calls can't be
+  read either;
 - has one of its input files changed by another process while it runs.
 
 xcache prints the reason when this happens.

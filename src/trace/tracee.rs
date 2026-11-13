@@ -4,6 +4,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use nix::unistd::Pid;
 
@@ -96,12 +97,29 @@ fn registers(pid: Pid) -> Option<libc::user_regs_struct> {
     (read == 0 && iov.iov_len == size_of::<libc::user_regs_struct>()).then_some(regs)
 }
 
+/// Set once the kernel has refused to show a tracee's memory, which a process
+/// that makes itself undumpable causes. The calls it made went unrecorded.
+static MEMORY_WAS_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+pub fn memory_was_hidden() -> bool {
+    MEMORY_WAS_HIDDEN.load(Ordering::Relaxed)
+}
+
 pub fn read_memory(pid: Pid, address: u64, buffer: &mut [u8]) -> io::Result<usize> {
     let local = libc::iovec { iov_base: buffer.as_mut_ptr().cast(), iov_len: buffer.len() };
     let remote = libc::iovec { iov_base: address as *mut libc::c_void, iov_len: buffer.len() };
     // SAFETY: both iovecs describe valid ranges; the remote one is only read.
     let read = unsafe { libc::process_vm_readv(pid.as_raw(), &local, 1, &remote, 1, 0) };
-    if read < 0 { Err(io::Error::last_os_error()) } else { Ok(read as usize) }
+    if read >= 0 {
+        return Ok(read as usize);
+    }
+    let error = io::Error::last_os_error();
+    let call_fails_too = error.raw_os_error() == Some(libc::EFAULT);
+    let thread_is_gone = error.raw_os_error() == Some(libc::ESRCH);
+    if !call_fails_too && !thread_is_gone {
+        MEMORY_WAS_HIDDEN.store(true, Ordering::Relaxed);
+    }
+    Err(error)
 }
 
 pub fn read_exact(pid: Pid, address: u64, length: usize) -> Option<Vec<u8>> {

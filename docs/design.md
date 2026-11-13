@@ -278,6 +278,11 @@ tries it on one of its own descriptors before it asks for a listener
 (`notify.rs`, `available`). Without one, or with `--tracer ptrace`, the reads
 and probes stop in the tracer too, and record the same inputs.
 
+The kernel does not show the memory of a process that made itself undumpable
+(`prctl(PR_SET_DUMPABLE, 0)`), to its tracer either. The paths in that
+process's calls can't be read, so nothing it looked at is recorded, and the
+result is not stored (`tracee.rs`, `memory_was_hidden`).
+
 Like ptrace, the supervisor reads arguments the caller's other threads could
 still change before the kernel reads them again. The tracer records what a
 program shows it; it is not a sandbox.
