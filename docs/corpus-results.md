@@ -50,6 +50,7 @@ mode compared runs:
 | libuv `ctest` | checking each datagram's receiver was quadratic, so a test timed out only under xcache | `many_datagrams_to_its_own_sockets_stay_fast` |
 | cargo and cmake in shadow mode | restored outputs were older than a fresh checkout's sources | `restored_outputs_are_newer_than_the_checkout_they_are_restored_into` |
 | go test, cargo test in shadow mode | shadow mode left fresh-only files, lost hard links and kept the fresh result | `shadow_mode_leaves_what_a_hit_would_so_later_commands_see_the_same_files`, `shadow_mode_removes_files_only_the_fresh_run_created` |
+| cargo's jobserver, which opens `/dev/fd/N` (corpus run of 2026-11-13) | xcache followed `/dev/fd` into its own descriptors and stored the files it had open as outputs, so restoring failed or would have overwritten them | `a_file_written_through_dev_fd_is_restored`, `a_file_read_through_dev_fd_is_an_input`, `a_file_reached_through_a_link_to_proc_self_is_not_cached` |
 | Gradle, cargo, kotlinpoet in shadow mode | reads the cached run did as checks, or of files it had overwritten, counted as unrecorded | `reading_what_the_cached_run_only_checked_is_not_a_false_hit`, `reading_a_file_the_cached_run_overwrote_unseen_is_not_a_false_hit` |
 
 ## What is not cacheable

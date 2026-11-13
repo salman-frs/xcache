@@ -30,6 +30,16 @@ fn renaming_a_directory_it_did_not_create_is_not_cached() {
 }
 
 #[test]
+fn a_file_reached_through_a_link_to_proc_self_is_not_cached() {
+    let ws = Workspace::new();
+    ws.write("out.txt", "old");
+    std::os::unix::fs::symlink("/proc/self/fd", ws.path("fds")).unwrap();
+    let run = ws.sh("exec 3<out.txt; echo new > fds/3");
+    assert_outcome(&run, "not_cached");
+    assert!(run.reasons().contains("/proc/self"), "{}", run.reasons());
+}
+
+#[test]
 fn unknown_commands_exit_127() {
     let ws = Workspace::new();
     let run = ws.run(&["definitely-not-a-command"]);

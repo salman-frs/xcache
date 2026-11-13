@@ -16,6 +16,18 @@ fn changed_content_misses() {
 }
 
 #[test]
+fn a_file_read_through_dev_fd_is_an_input() {
+    let ws = Workspace::new();
+    ws.write("dir/in.txt", "one");
+    let script = "exec 3<dir; cat /dev/fd/3/in.txt > out.txt";
+    assert_outcome(&ws.sh(script), "miss");
+    assert_outcome(&ws.sh(script), "hit");
+    ws.write("dir/in.txt", "two");
+    assert_outcome(&ws.sh(script), "miss");
+    assert_eq!(ws.read("out.txt"), "two");
+}
+
+#[test]
 fn a_new_header_that_shadows_an_old_one_misses() {
     let ws = Workspace::new();
     ws.write("b/config.h", "#define VALUE 1\n");
