@@ -174,14 +174,12 @@ results](docs/corpus-results.md):
 
 - 93% of steps are cacheable, and all of those hit from a fresh checkout of the
   same commit.
-- A miss takes 21% longer than running the command directly (median), from +8%
-  for CMake to +29% for Gradle.
-- A hit is 15x to 48x faster than running the step (median per ecosystem).
+- A miss takes 12% longer than running the command directly (median), from +2%
+  for CMake to +18% for Rust.
+- A hit is 12x to 56x faster than running the step (median per ecosystem).
 - Shadow mode found no wrong result.
 
-Those results are from before reads were recorded through a seccomp listener,
-which makes a miss cheaper. [docs/design.md](docs/design.md#open-problems) has
-what was measured since, and what remains slow.
+[docs/design.md](docs/design.md#open-problems) has what remains slow on a miss.
 
 ## How it works
 

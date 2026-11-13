@@ -408,7 +408,7 @@ blobs that no remaining entry uses, and deletes stat caches from other boots.
   anyhow and commander, +10% to +15% for click, testify and koa, +27% for
   uuid, +39% for markupsafe and +79% for zlib. On GitHub's runners the median
   of the 29 corpus projects went from +21% to +12%
-  ([run](https://github.com/salman-frs/xcache/actions/runs/43434180556)).
+  ([corpus-results.md](corpus-results.md)).
 
   Steps that are mostly path lookups stay expensive. In zlib's test step the
   supervisor spends about 5 microseconds on each of 72,000 notifications,
