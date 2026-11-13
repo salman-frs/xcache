@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use crate::observe;
 use crate::record::Recording;
 use crate::store::{Output, OutputState, Store, unique_name};
+use crate::sync::on_all_cpus;
 
 pub fn capture(recording: &Recording, store: &Store) -> Result<Vec<Output>> {
     let mut paths: BTreeSet<PathBuf> = recording.outputs.clone();
@@ -21,7 +22,7 @@ pub fn capture(recording: &Recording, store: &Store) -> Result<Vec<Output>> {
 
     let end_of_run = SystemTime::now();
     let mut first_name_of_inode: HashMap<(u64, u64), PathBuf> = HashMap::new();
-    let mut outputs = Vec::with_capacity(paths.len());
+    let mut found = Vec::with_capacity(paths.len());
     for path in paths {
         let meta = fs::symlink_metadata(&path);
         let age_ns = meta
@@ -56,16 +57,45 @@ pub fn capture(recording: &Recording, store: &Store) -> Result<Vec<Output>> {
                 if meta.nlink() > 1 {
                     first_name_of_inode.insert((meta.dev(), meta.ino()), path.clone());
                 }
-                let (content, size) =
-                    store.put_file(&path).with_context(|| format!("storing output {}", path.display()))?;
-                OutputState::File { mode: observe::permission_bits(&meta), size, content }
+                found.push(Found { path, age_ns, chosen_mtime_ns, state: None, mode: observe::permission_bits(&meta) });
+                continue;
             }
             Ok(meta) if meta.file_type().is_socket() => continue,
             Ok(_) => bail!("creates a FIFO or device: {}", path.display()),
         };
-        outputs.push(Output { path, state, age_ns, chosen_mtime_ns });
+        found.push(Found { path, age_ns, chosen_mtime_ns, state: Some(state), mode: 0 });
     }
-    Ok(outputs)
+
+    let states = on_all_cpus(&found, |output| match &output.state {
+        Some(state) => Ok(state.clone()),
+        None => {
+            let (content, size) =
+                store.put_file(&output.path).with_context(|| format!("storing output {}", output.path.display()))?;
+            Ok(OutputState::File { mode: output.mode, size, content })
+        }
+    });
+    found
+        .into_iter()
+        .zip(states)
+        .map(|(output, state): (Found, Result<OutputState>)| {
+            Ok(Output {
+                path: output.path,
+                state: state?,
+                age_ns: output.age_ns,
+                chosen_mtime_ns: output.chosen_mtime_ns,
+            })
+        })
+        .collect()
+}
+
+/// An output as found after the run. The content of a file is stored after
+/// all of them are found, so `state` is None for a file until then.
+struct Found {
+    path: PathBuf,
+    age_ns: u64,
+    chosen_mtime_ns: Option<i64>,
+    state: Option<OutputState>,
+    mode: u32,
 }
 
 /// Restored outputs are dated a step apart, in their original order, just before
@@ -292,12 +322,13 @@ mod tests {
         let outputs = capture(&recorder.finish(), &store).unwrap();
         fs::remove_file(&older).unwrap();
         fs::remove_file(&newer).unwrap();
+        let work_tree_changed = SystemTime::now();
+        std::thread::sleep(Duration::from_millis(1));
         restore(&outputs, &store).unwrap();
 
         let modified = |path: &Path| fs::metadata(path).unwrap().modified().unwrap();
         assert!(modified(&older) < modified(&newer));
-        let restore_started = SystemTime::now() - Duration::from_millis(10);
-        assert!(modified(&older) > restore_started, "restored outputs must be newer than the work tree");
+        assert!(modified(&older) > work_tree_changed, "restored outputs must be newer than the work tree");
     }
 
     #[test]

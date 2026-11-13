@@ -277,3 +277,27 @@ fn reads_through_proc_self_are_inputs() {
     assert_outcome(&ws.sh("cat /proc/self/cwd/in.txt > out.txt"), "miss");
     assert_eq!(ws.read("out.txt"), "two");
 }
+
+#[test]
+fn relative_paths_follow_every_change_of_directory() {
+    let ws = Workspace::new();
+    ws.write("in.txt", "decoy");
+    ws.write("by-name/in.txt", "a");
+    ws.write("by-descriptor/in.txt", "b");
+    let script = "import os\n\
+        os.chdir('by-name'); first = open('in.txt').read()\n\
+        os.fchdir(os.open('../by-descriptor', os.O_RDONLY)); second = open('in.txt').read()\n\
+        print(first + second)";
+    let command = ["python3", "-c", script];
+
+    assert_outcome(&ws.run(&command), "miss");
+    assert_outcome(&ws.run(&command), "hit");
+    ws.write("in.txt", "another decoy");
+    assert_outcome(&ws.run(&command), "hit");
+    for (changed, printed) in [("by-descriptor/in.txt", "aB\n"), ("by-name/in.txt", "AB\n")] {
+        ws.write(changed, &ws.read(changed).to_uppercase());
+        let run = ws.run(&command);
+        assert_outcome(&run, "miss");
+        assert_eq!(run.stdout, printed);
+    }
+}

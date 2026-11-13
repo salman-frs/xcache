@@ -8,6 +8,8 @@ pub enum Call {
     OpenHow { dirfd: i32, path: u64, how: u64 },
     Exec { dirfd: i32, path: u64, flags: u64 },
     Probe { dirfd: i32, path: u64, flags: u64, access: Access },
+    ChangeDirectory { path: u64 },
+    ChangeDirectoryToDescriptor,
     List { fd: i32 },
     Unlink { dirfd: i32, path: u64, flags: u64 },
     Rename { old_dirfd: i32, old: u64, new_dirfd: i32, new: u64, flags: u64 },
@@ -26,7 +28,7 @@ pub enum Call {
     Clone3 { args: u64 },
     Unshare { flags: u64 },
     Accept,
-    Bind { addr: u64, len: u64 },
+    Bind { fd: i32, addr: u64, len: u64 },
     Unsupported(&'static str),
 }
 
@@ -46,7 +48,8 @@ pub fn decode(nr: u64, args: [u64; 6]) -> Option<Call> {
         libc::SYS_faccessat => Call::Probe { dirfd: fd(0), path: a1, flags: 0, access: Access::Stat },
         libc::SYS_faccessat2 => Call::Probe { dirfd: fd(0), path: a1, flags: a3, access: Access::Stat },
         libc::SYS_readlinkat => Call::Probe { dirfd: fd(0), path: a1, flags: 0, access: Access::Lstat },
-        libc::SYS_chdir => Call::Probe { dirfd: AT_FDCWD, path: a0, flags: 0, access: Access::Stat },
+        libc::SYS_chdir => Call::ChangeDirectory { path: a0 },
+        libc::SYS_fchdir => Call::ChangeDirectoryToDescriptor,
         libc::SYS_getdents64 => Call::List { fd: fd(0) },
         libc::SYS_unlinkat => Call::Unlink { dirfd: fd(0), path: a1, flags: a2 },
         libc::SYS_renameat => Call::Rename { old_dirfd: fd(0), old: a1, new_dirfd: fd(2), new: a3, flags: 0 },
@@ -67,7 +70,7 @@ pub fn decode(nr: u64, args: [u64; 6]) -> Option<Call> {
         libc::SYS_unshare => Call::Unshare { flags: a0 },
         libc::SYS_setns => Call::Unsupported("joins another Linux namespace"),
         libc::SYS_accept | libc::SYS_accept4 => Call::Accept,
-        libc::SYS_bind => Call::Bind { addr: a1, len: a2 },
+        libc::SYS_bind => Call::Bind { fd: fd(0), addr: a1, len: a2 },
         libc::SYS_mount
         | libc::SYS_umount2
         | libc::SYS_pivot_root
@@ -118,19 +121,60 @@ fn decode_legacy(nr: c_long, args: [u64; 6]) -> Option<Call> {
     Some(call)
 }
 
-pub fn traced() -> Vec<c_long> {
-    let common = [
-        libc::SYS_openat,
-        libc::SYS_openat2,
-        libc::SYS_execve,
-        libc::SYS_execveat,
+/// What the seccomp filter does with a system call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rule {
+    /// Stops in the tracer, which can also wait for the result.
+    Trace,
+    /// Only looks at the filesystem, so its arguments are all that is recorded.
+    Observe,
+    /// Observed when the flags argument has none of the `writing` bits, traced
+    /// otherwise.
+    ObserveReading { flags: usize, writing: u32 },
+    /// Traced when the flags argument has any of the `noted` bits, allowed
+    /// otherwise.
+    TraceFlagged { flags: usize, noted: u32 },
+    /// Fails with `ENOSYS`.
+    Refuse,
+}
+
+const OPEN_WRITING: u32 = (libc::O_ACCMODE | libc::O_CREAT | libc::O_TRUNC) as u32;
+pub const NAMESPACE_FLAGS: u64 = (libc::CLONE_NEWNS
+    | libc::CLONE_NEWCGROUP
+    | libc::CLONE_NEWUTS
+    | libc::CLONE_NEWIPC
+    | libc::CLONE_NEWUSER
+    | libc::CLONE_NEWPID
+    | libc::CLONE_NEWNET) as u64;
+pub const CLONE_UNTRACED: u64 = libc::CLONE_UNTRACED as u64;
+
+/// Whether the filter shows this call to the supervisor rather than stopping.
+pub fn is_observed(nr: u64, args: [u64; 6]) -> bool {
+    rules().into_iter().any(|(rule_nr, rule)| {
+        rule_nr as u64 == nr
+            && match rule {
+                Rule::Observe => true,
+                Rule::ObserveReading { flags, writing } => args[flags] as u32 & writing == 0,
+                Rule::Trace | Rule::TraceFlagged { .. } | Rule::Refuse => false,
+            }
+    })
+}
+
+pub fn rules() -> Vec<(c_long, Rule)> {
+    let observed = [
         libc::SYS_newfstatat,
         libc::SYS_statx,
         libc::SYS_faccessat,
         libc::SYS_faccessat2,
         libc::SYS_readlinkat,
-        libc::SYS_chdir,
         libc::SYS_getdents64,
+        libc::SYS_execve,
+        libc::SYS_execveat,
+    ];
+    let traced = [
+        libc::SYS_openat2,
+        libc::SYS_chdir,
+        libc::SYS_fchdir,
         libc::SYS_unlinkat,
         libc::SYS_renameat,
         libc::SYS_renameat2,
@@ -147,7 +191,6 @@ pub fn traced() -> Vec<c_long> {
         libc::SYS_sendto,
         libc::SYS_sendmsg,
         libc::SYS_sendmmsg,
-        libc::SYS_clone,
         libc::SYS_clone3,
         libc::SYS_unshare,
         libc::SYS_setns,
@@ -167,17 +210,27 @@ pub fn traced() -> Vec<c_long> {
         libc::SYS_chroot,
         libc::SYS_open_by_handle_at,
     ];
-    #[cfg(not(target_arch = "x86_64"))]
-    let legacy: [c_long; 0] = [];
+    let refused = [libc::SYS_io_uring_setup, libc::SYS_io_uring_enter, libc::SYS_io_uring_register];
+
+    let mut rules = vec![
+        (libc::SYS_openat, Rule::ObserveReading { flags: 2, writing: OPEN_WRITING }),
+        (libc::SYS_clone, Rule::TraceFlagged { flags: 0, noted: (NAMESPACE_FLAGS | CLONE_UNTRACED) as u32 }),
+    ];
+    rules.extend(observed.map(|nr| (nr, Rule::Observe)));
+    rules.extend(traced.map(|nr| (nr, Rule::Trace)));
+    // io_uring can read files without a system call per file; refusing it makes
+    // runtimes fall back to ordinary, observable system calls.
+    rules.extend(refused.map(|nr| (nr, Rule::Refuse)));
     #[cfg(target_arch = "x86_64")]
-    let legacy = [
-        libc::SYS_open,
+    rules.extend(legacy_rules());
+    rules
+}
+
+#[cfg(target_arch = "x86_64")]
+fn legacy_rules() -> Vec<(c_long, Rule)> {
+    let observed = [libc::SYS_stat, libc::SYS_access, libc::SYS_lstat, libc::SYS_readlink, libc::SYS_getdents];
+    let traced = [
         libc::SYS_creat,
-        libc::SYS_stat,
-        libc::SYS_access,
-        libc::SYS_lstat,
-        libc::SYS_readlink,
-        libc::SYS_getdents,
         libc::SYS_unlink,
         libc::SYS_rmdir,
         libc::SYS_rename,
@@ -190,13 +243,10 @@ pub fn traced() -> Vec<c_long> {
         libc::SYS_utimes,
         libc::SYS_futimesat,
     ];
-    common.into_iter().chain(legacy).collect()
-}
-
-/// Calls that bypass per-call tracing entirely; refusing them makes runtimes
-/// fall back to ordinary, observable system calls.
-pub fn refused() -> Vec<c_long> {
-    vec![libc::SYS_io_uring_setup, libc::SYS_io_uring_enter, libc::SYS_io_uring_register]
+    let mut rules = vec![(libc::SYS_open, Rule::ObserveReading { flags: 1, writing: OPEN_WRITING })];
+    rules.extend(observed.map(|nr| (nr, Rule::Observe)));
+    rules.extend(traced.map(|nr| (nr, Rule::Trace)));
+    rules
 }
 
 #[cfg(test)]
@@ -204,9 +254,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_traced_call_is_decoded() {
-        for nr in traced() {
-            assert!(decode(nr as u64, [0; 6]).is_some(), "syscall {nr} is traced but not decoded");
+    fn every_stopping_call_is_decoded() {
+        for (nr, rule) in rules() {
+            if rule != Rule::Refuse {
+                assert!(decode(nr as u64, [0; 6]).is_some(), "syscall {nr} stops but is not decoded");
+            }
         }
     }
 

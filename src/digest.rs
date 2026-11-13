@@ -2,16 +2,17 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read};
-use std::num::NonZeroUsize;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::git;
+use crate::sync::{available_cpus, lock, on_all_cpus};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Digest([u8; 32]);
@@ -81,6 +82,58 @@ pub struct ContentHasher {
     cache_path: Option<PathBuf>,
     known: HashMap<FileKey, Known>,
     dirty: bool,
+    early: Option<EarlyHashing>,
+}
+
+/// Threads that hash files while the command still runs, at the lowest
+/// priority, so the command keeps the CPUs it can use.
+struct EarlyHashing {
+    batch: Vec<PathBuf>,
+    batch_size: u64,
+    batches: Sender<Vec<PathBuf>>,
+    hashed: Receiver<(FileKey, Known)>,
+}
+
+impl EarlyHashing {
+    fn start() -> Self {
+        let (batches, queue) = mpsc::channel::<Vec<PathBuf>>();
+        let (results, hashed) = mpsc::channel();
+        let queue = Arc::new(Mutex::new(queue));
+        for _ in 0..available_cpus() {
+            let (queue, results) = (Arc::clone(&queue), results.clone());
+            let hash_batches = move || {
+                // SAFETY: setpriority takes no pointers; on Linux it applies to the calling thread.
+                unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 19) };
+                loop {
+                    let Ok(batch) = lock(&queue).recv() else {
+                        break;
+                    };
+                    for path in batch {
+                        let learned = digest_of(&path, &HashMap::new()).ok().and_then(|(_, learned)| learned);
+                        if let Some(learned) = learned
+                            && results.send(learned).is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            };
+            // Without the thread, the files wait for `prefetch`.
+            let _ = thread::Builder::new().name("xcache-hash".into()).spawn(hash_batches);
+        }
+        Self { batch: Vec::new(), batch_size: 0, batches, hashed }
+    }
+
+    /// Waking a hashing thread delays the caller by more than a small file
+    /// takes to hash, so files are handed over a batch at a time.
+    fn add(&mut self, path: &Path, size: u64) {
+        self.batch.push(path.to_path_buf());
+        self.batch_size += size;
+        if self.batch.len() >= EARLY_BATCH_FILES || self.batch_size >= EARLY_BATCH_BYTES {
+            self.batch_size = 0;
+            let _ = self.batches.send(std::mem::take(&mut self.batch));
+        }
+    }
 }
 
 type FileKey = (u64, u64);
@@ -100,6 +153,8 @@ struct Known {
     settled: bool,
 }
 
+const EARLY_BATCH_FILES: usize = 32;
+const EARLY_BATCH_BYTES: u64 = 1 << 20;
 const PARALLEL_HASHING_MIN: u64 = 4 << 20;
 const PARALLEL_HASHING_CHUNK: usize = 4 << 20;
 const CACHE_MAGIC: &[u8] = b"xcache-stat-v2\n";
@@ -126,15 +181,32 @@ impl Stamp {
 impl ContentHasher {
     #[cfg(test)]
     pub fn in_memory() -> Self {
-        Self { cache_path: None, known: HashMap::new(), dirty: false }
+        Self { cache_path: None, known: HashMap::new(), dirty: false, early: None }
     }
 
     pub fn load(cache_path: Option<PathBuf>) -> Self {
         let known = cache_path.as_ref().and_then(|path| fs::read(path).ok()).map(|bytes| parse_cache(&bytes));
-        Self { cache_path, known: known.unwrap_or_default(), dirty: false }
+        Self { cache_path, known: known.unwrap_or_default(), dirty: false, early: None }
+    }
+
+    /// Has a file hashed before its digest is asked for, unless it is known
+    /// already. `meta` is the file's metadata.
+    pub fn hash_early(&mut self, path: &Path, meta: &fs::Metadata) {
+        if self.known.get(&(meta.dev(), meta.ino())).is_some_and(|known| known.stamp == Stamp::of(meta)) {
+            return;
+        }
+        self.early.get_or_insert_with(EarlyHashing::start).add(path, meta.len());
+    }
+
+    fn remember_what_was_hashed_early(&mut self) {
+        let hashed: Vec<(FileKey, Known)> = self.early.iter().flat_map(|early| early.hashed.try_iter()).collect();
+        for learned in hashed {
+            self.remember(Some(learned));
+        }
     }
 
     pub fn hash_file(&mut self, path: &Path) -> io::Result<Digest> {
+        self.remember_what_was_hashed_early();
         let (digest, learned) = digest_of(path, &self.known)?;
         self.remember(learned);
         Ok(digest)
@@ -142,29 +214,14 @@ impl ContentHasher {
 
     /// Hashes files on all CPUs, so the `hash_file` calls that follow are lookups.
     pub fn prefetch(&mut self, paths: &[&Path]) {
+        self.remember_what_was_hashed_early();
         let mut paths = paths.to_vec();
         paths.sort_unstable();
         paths.dedup();
-        let paths = paths.as_slice();
-        let next = AtomicUsize::new(0);
-        let workers = thread::available_parallelism().map_or(1, NonZeroUsize::get).min(paths.len());
         let known = &self.known;
-        let learned: Vec<(FileKey, Known)> = thread::scope(|scope| {
-            let workers: Vec<_> = (0..workers)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let mut learned = Vec::new();
-                        while let Some(path) = paths.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            learned.extend(digest_of(path, known).ok().and_then(|(_, learned)| learned));
-                        }
-                        learned
-                    })
-                })
-                .collect();
-            workers.into_iter().flat_map(|worker| worker.join().unwrap_or_default()).collect()
-        });
-        for entry in learned {
-            self.remember(Some(entry));
+        let learned = on_all_cpus(&paths, |path| digest_of(path, known).ok().and_then(|(_, learned)| learned));
+        for learned in learned {
+            self.remember(learned);
         }
     }
 

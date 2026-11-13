@@ -7,11 +7,13 @@ use std::os::unix::ffi::OsStrExt;
 use anyhow::{Context, Result};
 use nix::unistd::Pid;
 
-use super::filter::Filter;
+use super::filter::{Filter, Observer};
 use super::syscalls;
 use crate::invocation::Invocation;
 
 const STATUS_FD: RawFd = 3;
+/// Where the child keeps its seccomp listener until exec, for the tracer to copy.
+pub const LISTENER_FD: RawFd = 4;
 
 #[derive(Clone, Copy, Debug)]
 #[repr(u8)]
@@ -49,8 +51,10 @@ impl SetupStatus {
     }
 }
 
-pub fn spawn(invocation: &Invocation) -> Result<Child> {
-    let setup = ChildSetup::prepare(invocation)?;
+/// With `notify`, the child asks for a seccomp listener and leaves it at
+/// LISTENER_FD if the kernel gives it one.
+pub fn spawn(invocation: &Invocation, notify: bool) -> Result<Child> {
+    let setup = ChildSetup::prepare(invocation, notify)?;
     let (stdout, stdout_write) = pipe()?;
     let (stderr, stderr_write) = pipe()?;
     let (status, status_write) = pipe()?;
@@ -79,11 +83,13 @@ struct ChildSetup {
     _strings: Vec<CString>,
     argv: Vec<*const libc::c_char>,
     envp: Vec<*const libc::c_char>,
-    filter: Filter,
+    tracing: Filter,
+    /// Shows the supervisor the calls that are only observed.
+    notifying: Option<Filter>,
 }
 
 impl ChildSetup {
-    fn prepare(invocation: &Invocation) -> Result<Self> {
+    fn prepare(invocation: &Invocation, notify: bool) -> Result<Self> {
         let c_string = |bytes: &[u8]| CString::new(bytes).context("argument contains a NUL byte");
         let program = invocation.argv.first().context("empty command")?;
         let candidates = program_candidates(program.as_bytes(), invocation.path_var())
@@ -105,7 +111,8 @@ impl ChildSetup {
             _strings: args.into_iter().chain(vars).collect(),
             argv,
             envp,
-            filter: Filter::new(&syscalls::traced(), &syscalls::refused()),
+            tracing: Filter::new(&syscalls::rules(), Observer::Tracer),
+            notifying: notify.then(|| Filter::new(&syscalls::rules(), Observer::Supervisor)),
         })
     }
 
@@ -120,17 +127,13 @@ impl ChildSetup {
             libc::fcntl(STATUS_FD, libc::F_SETFD, libc::FD_CLOEXEC);
             close_from(STATUS_FD + 1);
 
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 || !self.install_filter() {
+                fail(SetupFailure::Seccomp);
+            }
             if libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) != 0 {
                 fail(SetupFailure::Ptrace);
             }
             libc::raise(libc::SIGSTOP);
-
-            let program = self.filter.program();
-            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
-                || libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, 0, &program) != 0
-            {
-                fail(SetupFailure::Seccomp);
-            }
 
             let mut errno = libc::ENOENT;
             for candidate in &self.candidates {
@@ -143,6 +146,35 @@ impl ChildSetup {
             *libc::__errno_location() = errno;
             fail(SetupFailure::Exec)
         }
+    }
+
+    /// Installs the notifying filter if the kernel gives it a listener, and the
+    /// tracing filter otherwise. A listener is refused to a process that
+    /// already runs under one.
+    unsafe fn install_filter(&self) -> bool {
+        const NEW_LISTENER: libc::c_ulong = libc::SECCOMP_FILTER_FLAG_NEW_LISTENER;
+        // Since Linux 5.19: no signal interrupts a call the supervisor has received.
+        const WAIT_KILLABLE_RECV: libc::c_ulong = libc::SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV;
+        let install = |filter: &Filter, flags: libc::c_ulong| {
+            let program = filter.program();
+            // SAFETY: the kernel copies the program, which outlives the call.
+            unsafe { libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, flags, &program) }
+        };
+        if let Some(notifying) = &self.notifying {
+            for flags in [NEW_LISTENER | WAIT_KILLABLE_RECV, NEW_LISTENER] {
+                let listener = install(notifying, flags) as RawFd;
+                if listener == LISTENER_FD {
+                    return true;
+                }
+                if listener >= 0 {
+                    // SAFETY: dup3 and close take descriptors this process owns.
+                    return unsafe {
+                        libc::dup3(listener, LISTENER_FD, libc::O_CLOEXEC) == LISTENER_FD && libc::close(listener) == 0
+                    };
+                }
+            }
+        }
+        install(&self.tracing, 0) == 0
     }
 }
 
@@ -183,7 +215,7 @@ fn program_candidates(program: &[u8], path_var: Option<&OsStr>) -> Vec<Vec<u8>> 
         .collect()
 }
 
-fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+pub fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0; 2];
     // SAFETY: pipe2 fills both descriptors on success.
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {

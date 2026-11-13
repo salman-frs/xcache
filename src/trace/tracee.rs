@@ -1,10 +1,14 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use nix::unistd::Pid;
+
+use super::directories::WorkingDirectories;
 
 const PTRACE_GET_SYSCALL_INFO: libc::c_uint = 0x420e;
 const OP_EXIT: u8 = 2;
@@ -64,12 +68,58 @@ pub fn syscall_result(pid: Pid) -> io::Result<i64> {
     Ok(info.data[0] as i64)
 }
 
+/// The call a thread stopped for a signal will run again if the signal is
+/// not delivered. x86_64 shows that as the result -ERESTARTSYS; on aarch64
+/// the kernel has already moved the PC back to the `svc`.
+pub fn restartable_call(pid: Pid) -> Option<(u64, [u64; 6])> {
+    let regs = registers(pid)?;
+    #[cfg(target_arch = "x86_64")]
+    {
+        const ERESTARTSYS: i64 = 512;
+        (regs.rax as i64 == -ERESTARTSYS)
+            .then_some((regs.orig_rax, [regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9]))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        const SVC_0: [u8; 4] = 0xd400_0001_u32.to_le_bytes();
+        let [a0, a1, a2, a3, a4, a5, ..] = regs.regs;
+        (read_exact(pid, regs.pc, 4)? == SVC_0).then_some((regs.regs[8], [a0, a1, a2, a3, a4, a5]))
+    }
+}
+
+fn registers(pid: Pid) -> Option<libc::user_regs_struct> {
+    const NT_PRSTATUS: libc::c_int = 1;
+    // SAFETY: user_regs_struct is plain data the kernel fills.
+    let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+    let mut iov = libc::iovec { iov_base: (&raw mut regs).cast(), iov_len: size_of::<libc::user_regs_struct>() };
+    // SAFETY: the kernel writes at most iov_len bytes into regs.
+    let read = unsafe { libc::ptrace(libc::PTRACE_GETREGSET, pid.as_raw(), NT_PRSTATUS, &mut iov) };
+    (read == 0 && iov.iov_len == size_of::<libc::user_regs_struct>()).then_some(regs)
+}
+
+/// Set once the kernel has refused to show a tracee's memory, which a process
+/// that makes itself undumpable causes. The calls it made went unrecorded.
+static MEMORY_WAS_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+pub fn memory_was_hidden() -> bool {
+    MEMORY_WAS_HIDDEN.load(Ordering::Relaxed)
+}
+
 pub fn read_memory(pid: Pid, address: u64, buffer: &mut [u8]) -> io::Result<usize> {
     let local = libc::iovec { iov_base: buffer.as_mut_ptr().cast(), iov_len: buffer.len() };
     let remote = libc::iovec { iov_base: address as *mut libc::c_void, iov_len: buffer.len() };
     // SAFETY: both iovecs describe valid ranges; the remote one is only read.
     let read = unsafe { libc::process_vm_readv(pid.as_raw(), &local, 1, &remote, 1, 0) };
-    if read < 0 { Err(io::Error::last_os_error()) } else { Ok(read as usize) }
+    if read >= 0 {
+        return Ok(read as usize);
+    }
+    let error = io::Error::last_os_error();
+    let call_fails_too = error.raw_os_error() == Some(libc::EFAULT);
+    let thread_is_gone = error.raw_os_error() == Some(libc::ESRCH);
+    if !call_fails_too && !thread_is_gone {
+        MEMORY_WAS_HIDDEN.store(true, Ordering::Relaxed);
+    }
+    Err(error)
 }
 
 pub fn read_exact(pid: Pid, address: u64, length: usize) -> Option<Vec<u8>> {
@@ -85,10 +135,11 @@ pub fn read_c_string(pid: Pid, address: u64) -> Option<Vec<u8>> {
     }
     let mut bytes = Vec::new();
     let mut cursor = address;
+    let mut page = [0; PAGE as usize];
     while bytes.len() < PATH_MAX {
         let until_page_end = (PAGE - cursor % PAGE) as usize;
-        let mut chunk = vec![0; until_page_end.min(PATH_MAX - bytes.len())];
-        let read = read_memory(pid, cursor, &mut chunk).ok()?;
+        let chunk = &mut page[..until_page_end.min(PATH_MAX - bytes.len())];
+        let read = read_memory(pid, cursor, chunk).ok()?;
         if read == 0 {
             return None;
         }
@@ -102,29 +153,99 @@ pub fn read_c_string(pid: Pid, address: u64) -> Option<Vec<u8>> {
     None
 }
 
+/// A copy of a descriptor of the tracee, which needs Linux 5.6.
+pub fn copy_descriptor(pid: Pid, fd: RawFd) -> io::Result<OwnedFd> {
+    let pidfd = match process_descriptor(pid) {
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+            process_descriptor(thread_group(pid).ok_or(error)?)?
+        }
+        pidfd => pidfd?,
+    };
+    // SAFETY: pidfd_getfd returns a new close-on-exec descriptor or -1.
+    let copy = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };
+    if copy < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    Ok(unsafe { OwnedFd::from_raw_fd(copy as RawFd) })
+}
+
+pub fn process_descriptor(pid: Pid) -> io::Result<OwnedFd> {
+    // SAFETY: pidfd_open returns a new descriptor or -1.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.as_raw(), 0) };
+    if pidfd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor was just created and is owned here.
+    Ok(unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) })
+}
+
+/// The process a thread belongs to. A pidfd names a process unless it is
+/// opened with PIDFD_THREAD, which came in Linux 6.9.
+fn thread_group(tid: Pid) -> Option<Pid> {
+    let status = fs::read_to_string(format!("/proc/{tid}/status")).ok()?;
+    let tgid = status.lines().find_map(|line| line.strip_prefix("Tgid:"))?;
+    tgid.trim().parse().ok().map(Pid::from_raw)
+}
+
 pub fn fd_path(pid: Pid, fd: i32) -> Option<PathBuf> {
     let link = fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?;
     link.is_absolute().then_some(link)
 }
 
-pub fn resolve(pid: Pid, dirfd: i32, raw: &[u8]) -> Option<PathBuf> {
+pub fn working_directory(pid: Pid) -> Option<PathBuf> {
+    fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+/// The path a call names: `raw` as the tracee wrote it, after the directory
+/// it is relative to.
+pub fn resolve_at(directories: &WorkingDirectories, pid: Pid, dirfd: i32, raw: &[u8]) -> Option<PathBuf> {
     let raw = Path::new(OsStr::from_bytes(raw));
     let joined = if raw.is_absolute() {
         raw.to_path_buf()
     } else if dirfd == libc::AT_FDCWD {
-        fs::read_link(format!("/proc/{pid}/cwd")).ok()?.join(raw)
+        directories.of(pid)?.join(raw)
     } else {
         fd_path(pid, dirfd)?.join(raw)
     };
-    Some(as_seen_by(pid, &without_redundant_components(&joined)))
+    Some(as_seen_by(pid, without_redundant_components(joined)))
 }
 
-fn without_redundant_components(path: &Path) -> PathBuf {
+pub fn path_at(directories: &WorkingDirectories, pid: Pid, dirfd: i32, address: u64) -> Option<PathBuf> {
+    resolve_at(directories, pid, dirfd, &read_c_string(pid, address)?)
+}
+
+/// The path a call names, or the file its descriptor refers to when the call
+/// asks for that with an empty path.
+pub fn path_or_descriptor(
+    directories: &WorkingDirectories,
+    pid: Pid,
+    dirfd: i32,
+    address: u64,
+    flags: u64,
+) -> Option<PathBuf> {
+    let raw = read_c_string(pid, address)?;
+    if raw.is_empty() && flags & libc::AT_EMPTY_PATH as u64 != 0 {
+        fd_path(pid, dirfd)
+    } else {
+        resolve_at(directories, pid, dirfd, &raw)
+    }
+}
+
+fn without_redundant_components(path: PathBuf) -> PathBuf {
+    let names = path.as_os_str().as_bytes().get(1..).unwrap_or_default();
+    let is_redundant = |name: &[u8]| name.is_empty() || name == b".";
+    if names.is_empty() || !names.split(|&byte| byte == b'/').any(is_redundant) {
+        return path;
+    }
     path.components().filter(|component| *component != Component::CurDir).collect()
 }
 
 /// `/proc/self` means the tracee, not xcache, when the tracee says it.
-fn as_seen_by(pid: Pid, path: &Path) -> PathBuf {
+fn as_seen_by(pid: Pid, path: PathBuf) -> PathBuf {
+    if !path.as_os_str().as_bytes().starts_with(b"/proc/") {
+        return path;
+    }
     for (alias, target) in
         [("/proc/thread-self", format!("/proc/{pid}/task/{pid}")), ("/proc/self", format!("/proc/{pid}"))]
     {
@@ -132,7 +253,7 @@ fn as_seen_by(pid: Pid, path: &Path) -> PathBuf {
             return Path::new(&target).join(rest);
         }
     }
-    path.to_path_buf()
+    path
 }
 
 /// Files mapped into a freshly executed image: the executable itself and the
@@ -160,14 +281,17 @@ mod tests {
 
     #[test]
     fn current_directory_components_are_dropped_but_parents_kept() {
-        assert_eq!(without_redundant_components(Path::new("/a/./b//c/../d")), PathBuf::from("/a/b/c/../d"));
+        assert_eq!(without_redundant_components("/a/./b//c/../d".into()), PathBuf::from("/a/b/c/../d"));
+        assert_eq!(without_redundant_components("/a/b/".into()), PathBuf::from("/a/b"));
+        assert_eq!(without_redundant_components("/a/.b/c..".into()), PathBuf::from("/a/.b/c.."));
+        assert_eq!(without_redundant_components("/".into()), PathBuf::from("/"));
     }
 
     #[test]
     fn proc_self_refers_to_the_tracee() {
         let tracee = Pid::from_raw(42);
-        assert_eq!(as_seen_by(tracee, Path::new("/proc/self/cwd/a")), PathBuf::from("/proc/42/cwd/a"));
-        assert_eq!(as_seen_by(tracee, Path::new("/proc/selfish")), PathBuf::from("/proc/selfish"));
+        assert_eq!(as_seen_by(tracee, "/proc/self/cwd/a".into()), PathBuf::from("/proc/42/cwd/a"));
+        assert_eq!(as_seen_by(tracee, "/proc/selfish".into()), PathBuf::from("/proc/selfish"));
     }
 
     #[test]

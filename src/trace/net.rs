@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use nix::unistd::Pid;
@@ -89,6 +91,17 @@ impl KnownListeners {
         Self { by_port: HashMap::new() }
     }
 
+    /// Remembers a socket the command has just bound to a loopback port.
+    /// Without this it is found when something first connects to the port.
+    pub fn bound(&mut self, pid: Pid, fd: i32) {
+        if let Some(socket) = Socket::of(pid, fd)
+            && let Some(local) = socket.address(libc::getsockname)
+            && let Some(inode) = fd_socket_inode(pid, fd)
+        {
+            self.by_port.insert(local.port(), OpenSocket { pid, fd, inode });
+        }
+    }
+
     fn still_listening(&self, port: u16) -> bool {
         self.by_port.get(&port).is_some_and(|socket| fd_socket_inode(socket.pid, socket.fd) == Some(socket.inode))
     }
@@ -136,7 +149,13 @@ pub fn accepted_from_outside(
     tracees: &[Pid],
     opened_by_command: &mut HashSet<SocketAddr>,
 ) -> Option<String> {
-    let inode = socket_inode(&fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?.to_string_lossy())?;
+    if let Some(remote) = Socket::of(pid, fd).and_then(|socket| socket.address(libc::getpeername))
+        && remote.ip().is_loopback()
+        && opened_by_command.remove(&remote)
+    {
+        return None;
+    }
+    let inode = fd_socket_inode(pid, fd)?;
     let sockets = inet_sockets(pid);
     let accepted = sockets.iter().find(|socket| socket.inode == inode)?;
     if !accepted.remote.ip().is_loopback() {
@@ -153,8 +172,64 @@ pub fn accepted_from_outside(
 
 /// The local address of an internet socket.
 pub fn local_address(pid: Pid, fd: i32) -> Option<SocketAddr> {
-    let inode = socket_inode(&fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?.to_string_lossy())?;
+    if let Some(local) = Socket::of(pid, fd).and_then(|socket| socket.address(libc::getsockname)) {
+        return Some(local);
+    }
+    let inode = fd_socket_inode(pid, fd)?;
     inet_sockets(pid).into_iter().find(|socket| socket.inode == inode).map(|socket| socket.local)
+}
+
+/// A copy of a socket of the command, which the kernel answers questions
+/// about directly. Without one, the answers are searched for in /proc/net.
+struct Socket(OwnedFd);
+
+type AddressOf = unsafe extern "C" fn(libc::c_int, *mut libc::sockaddr, *mut libc::socklen_t) -> libc::c_int;
+
+impl Socket {
+    /// None before Linux 5.6, or if `fd` is not a socket of the thread: the
+    /// copy comes from its process, and a thread can have descriptors of its own.
+    fn of(pid: Pid, fd: i32) -> Option<Self> {
+        let copy = super::tracee::copy_descriptor(pid, fd).ok()?;
+        let inode = fs::File::from(copy.try_clone().ok()?).metadata().ok()?.ino();
+        (fd_socket_inode(pid, fd) == Some(inode)).then_some(Self(copy))
+    }
+
+    /// The address `getsockname` or `getpeername` gives, if it is an internet address.
+    fn address(&self, address_of: AddressOf) -> Option<SocketAddr> {
+        let mut storage = [0u8; MAX_SOCKADDR];
+        let mut length = MAX_SOCKADDR as libc::socklen_t;
+        // SAFETY: the kernel writes at most `length` bytes into `storage`.
+        if unsafe { address_of(self.0.as_raw_fd(), storage.as_mut_ptr().cast(), &mut length) } != 0 {
+            return None;
+        }
+        match parse_sockaddr(&storage[..(length as usize).min(MAX_SOCKADDR)]) {
+            Destination::Loopback { ip, port } => Some(SocketAddr::new(without_ipv4_mapping(ip), port)),
+            Destination::Remote(address) => address
+                .parse()
+                .ok()
+                .map(|address: SocketAddr| SocketAddr::new(without_ipv4_mapping(address.ip()), address.port())),
+            _ => None,
+        }
+    }
+
+    fn is_datagram(&self) -> bool {
+        let mut kind: libc::c_int = 0;
+        let mut length = size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: the kernel writes one int into `kind`.
+        let result = unsafe {
+            libc::getsockopt(self.0.as_raw_fd(), libc::SOL_SOCKET, libc::SO_TYPE, (&raw mut kind).cast(), &mut length)
+        };
+        result == 0 && kind == libc::SOCK_DGRAM
+    }
+}
+
+/// /proc/net shows IPv4-mapped addresses as IPv4, and both ends of a
+/// connection have to compare equal.
+fn without_ipv4_mapping(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    }
 }
 
 struct InetSocket {
@@ -191,6 +266,9 @@ pub fn is_bound(key: &Path) -> Option<bool> {
 
 /// Whether `fd` is a datagram socket and no other socket is bound to `port`.
 pub fn datagram_to_nobody(pid: Pid, fd: i32, port: u16) -> bool {
+    if Socket::of(pid, fd).is_some_and(|socket| !socket.is_datagram()) {
+        return false;
+    }
     let Some(inode) = fd_socket_inode(pid, fd) else {
         return false;
     };

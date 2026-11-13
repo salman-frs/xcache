@@ -16,6 +16,7 @@ use crate::observe::{self, State};
 use crate::outputs;
 use crate::stdio;
 use crate::store::{Entry, Input, RunResult, Store, unix_now};
+use crate::trace::Tracing;
 use report::{Report, Timings, millis};
 
 pub struct RunOptions {
@@ -25,6 +26,7 @@ pub struct RunOptions {
     pub shadow: bool,
     pub report: Option<PathBuf>,
     pub quiet: bool,
+    pub tracing: Tracing,
 }
 
 struct Execution {
@@ -101,7 +103,7 @@ pub fn run(options: RunOptions) -> Result<i32> {
         }
     }
 
-    let execution = execute::execute(&invocation, &store, &mut hasher, &console)?;
+    let execution = execute::execute(&invocation, &store, &mut hasher, options.tracing, &console)?;
     let duration = started.elapsed();
     report.executed(&execution, hit.is_some());
 

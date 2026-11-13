@@ -20,7 +20,8 @@ There are no binaries yet. Build from source with Rust 1.88 or newer:
 cargo install --path .
 ```
 
-xcache needs Linux 5.3 or newer. It has been tested on 6.8.
+xcache needs Linux 5.3 or newer, and traces fastest on 6.6 or newer. It has
+been tested on 6.8.
 
 ## Usage
 
@@ -125,6 +126,9 @@ A command still runs normally, but its result is not stored, when it:
 - leaves processes running after it exits (xcache kills them);
 - creates namespaces, mounts filesystems, or calls `chroot`;
 - renames a directory it didn't create;
+- has a process whose memory xcache may not read, such as one that calls
+  `prctl(PR_SET_DUMPABLE, 0)`, because the paths in its system calls can't be
+  read either;
 - has one of its input files changed by another process while it runs.
 
 xcache prints the reason when this happens.
@@ -147,8 +151,9 @@ appears there later.
 - Git's index and reflogs are compared without the times and identities they
   keep about the checkout, so a command that prints reflog dates or names gets
   the cached ones on a hit.
-- A miss is slower than running the command directly, because every traced
-  system call stops in xcache. See [Performance](#performance).
+- A miss is slower than running the command directly, because every system
+  call that looks at or changes the filesystem passes through xcache. See
+  [Performance](#performance).
 - Many tools check whether their outputs exist, so in a working tree that
   already has build output the first run misses once.
 - For a build script without `rerun-if-changed`, cargo stores the newest
@@ -174,15 +179,23 @@ results](docs/corpus-results.md):
 - A hit is 15x to 48x faster than running the step (median per ecosystem).
 - Shadow mode found no wrong result.
 
+Those results are from before reads were recorded through a seccomp listener,
+which makes a miss cheaper. [docs/design.md](docs/design.md#open-problems) has
+what was measured since, and what remains slow.
+
 ## How it works
 
 Every way a process can learn about the filesystem goes through a system call.
-xcache starts the command under ptrace with a seccomp filter that stops it on
-the calls that read or change the filesystem, and lets everything else run.
-For each call it records an input (file content, whether a path exists, the
-names in a directory) or an output. Before a write reaches the kernel, it
-captures the state the command depended on, so a file that is read and then
-rewritten is recorded with its original content.
+xcache starts the command under ptrace with a seccomp filter. The filter shows
+the calls that only look at the filesystem to a thread of xcache while the
+caller waits, stops the calls that change it in ptrace, and lets everything
+else run. `--tracer ptrace` stops both kinds in ptrace, which is also what
+happens on kernels before 5.6 and in containers that refuse `pidfd_getfd`, as
+Docker's default seccomp profile does. For each call xcache records an input
+(file content, whether a path exists, the names in a directory) or an output.
+Before a write reaches the kernel, it captures the state the command depended
+on, so a file that is read and then rewritten is recorded with its original
+content.
 
 Each stored result lists its inputs with the state they had. A lookup checks
 those states against the filesystem and restores the first result that
@@ -198,9 +211,8 @@ writing a cache key. Roughly in order:
 - A remote cache using the
   [Bazel Remote Execution API](https://github.com/bazelbuild/remote-apis), and
   a GitHub Action.
-- A tracer that records file accesses without stopping the command, for
-  example with fanotify or eBPF, so a miss costs less than 10% over an uncached
-  run.
+- Dropping repeated path lookups before they reach xcache, for example with
+  eBPF, so a miss costs less than 10% over an uncached run on every step.
 - Signed cache entries, and read-only access for untrusted pull requests.
 - [SLSA](https://slsa.dev/) provenance built from the recorded inputs.
 
