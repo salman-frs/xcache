@@ -25,6 +25,19 @@ fn hit_restores_outputs_and_replays_output_and_status() {
 }
 
 #[test]
+fn a_file_written_through_dev_fd_is_restored() {
+    let ws = Workspace::new();
+    ws.write("out.txt", "old");
+    let script = "exec 3<out.txt; echo new > /dev/fd/3";
+    assert_outcome(&ws.sh(script), "miss");
+    assert_eq!(ws.read("out.txt"), "new\n");
+
+    ws.write("out.txt", "old");
+    assert_outcome(&ws.sh(script), "hit");
+    assert_eq!(ws.read("out.txt"), "new\n");
+}
+
+#[test]
 fn paths_that_are_not_utf8_are_cached_and_restored() {
     let ws = Workspace::new();
     let script = "printf data > \"$(printf 'caf\\351')\"";

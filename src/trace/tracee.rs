@@ -243,6 +243,7 @@ fn without_redundant_components(path: PathBuf) -> PathBuf {
 
 /// `/proc/self` means the tracee, not xcache, when the tracee says it.
 fn as_seen_by(pid: Pid, path: PathBuf) -> PathBuf {
+    let path = through_link_to_proc_self(path);
     if !path.as_os_str().as_bytes().starts_with(b"/proc/") {
         return path;
     }
@@ -251,6 +252,23 @@ fn as_seen_by(pid: Pid, path: PathBuf) -> PathBuf {
     {
         if let Ok(rest) = path.strip_prefix(alias) {
             return Path::new(&target).join(rest);
+        }
+    }
+    path
+}
+
+/// `/dev/fd`, `/dev/stdin`, `/dev/stdout` and `/dev/stderr` are symlinks into
+/// `/proc/self`, which xcache would follow into its own descriptors.
+fn through_link_to_proc_self(path: PathBuf) -> PathBuf {
+    if !path.as_os_str().as_bytes().starts_with(b"/dev/") {
+        return path;
+    }
+    for link in ["/dev/fd", "/dev/stdin", "/dev/stdout", "/dev/stderr"] {
+        if let Ok(rest) = path.strip_prefix(link)
+            && let Ok(target) = fs::read_link(link)
+            && target.starts_with("/proc/self")
+        {
+            return target.components().chain(rest.components()).collect();
         }
     }
     path
@@ -292,6 +310,9 @@ mod tests {
         let tracee = Pid::from_raw(42);
         assert_eq!(as_seen_by(tracee, "/proc/self/cwd/a".into()), PathBuf::from("/proc/42/cwd/a"));
         assert_eq!(as_seen_by(tracee, "/proc/selfish".into()), PathBuf::from("/proc/selfish"));
+        assert_eq!(as_seen_by(tracee, "/dev/fd/3/a".into()), PathBuf::from("/proc/42/fd/3/a"));
+        assert_eq!(as_seen_by(tracee, "/dev/stderr".into()), PathBuf::from("/proc/42/fd/2"));
+        assert_eq!(as_seen_by(tracee, "/dev/fdx".into()), PathBuf::from("/dev/fdx"));
     }
 
     #[test]

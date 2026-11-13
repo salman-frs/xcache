@@ -5,6 +5,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::process;
 use std::time::SystemTime;
 
 use crate::digest::ContentHasher;
@@ -162,6 +163,9 @@ impl<'h> Recorder<'h> {
             entry = fs::symlink_metadata(&path);
         }
         let path = path.as_path();
+        if self.leads_to_xcache_itself(requested, path) {
+            return None;
+        }
         if self.is_excluded(path) {
             return None;
         }
@@ -311,6 +315,9 @@ impl<'h> Recorder<'h> {
             return;
         }
         let real = self.real_location(requested);
+        if self.leads_to_xcache_itself(requested, &real) {
+            return;
+        }
         let entry = fs::symlink_metadata(&real);
         if self.is_excluded(&real) || self.is_owned(&real, &entry) {
             return;
@@ -410,6 +417,16 @@ impl<'h> Recorder<'h> {
         }
     }
 
+    /// A symlink to `/proc/self` leads the command to its own process and
+    /// xcache to xcache's, so what the command found there is unknown.
+    fn leads_to_xcache_itself(&mut self, requested: &Path, real: &Path) -> bool {
+        let through_a_link = !requested.starts_with("/proc") && real.starts_with(format!("/proc/{}", process::id()));
+        if through_a_link {
+            self.taint(format!("reaches /proc/self through a symbolic link: {}", requested.display()));
+        }
+        through_a_link
+    }
+
     fn is_excluded(&self, real: &Path) -> bool {
         is_machine_state(real) || self.excluded.iter().any(|excluded| real.starts_with(excluded))
     }
@@ -450,9 +467,11 @@ impl<'h> Recorder<'h> {
 
     /// Where a path really lives: its parent directory with symlinks and `..`
     /// resolved, so lexical prefixes cannot alias another directory. Magic links
-    /// under /proc are followed through to their target.
+    /// under /proc are followed through to their target, except xcache's own.
     fn real_location(&mut self, path: &Path) -> PathBuf {
+        let names_xcache = path.starts_with("/proc/self") || path.starts_with("/proc/thread-self");
         if path.starts_with("/proc")
+            && !names_xcache
             && let Ok(real) = fs::canonicalize(path)
         {
             return real;
@@ -478,9 +497,13 @@ impl<'h> Recorder<'h> {
         Some(real)
     }
 
+    /// Links in /proc lead to what a process has open, so none is followed.
     fn resolve_symlinks(&mut self, link: &Path) -> PathBuf {
         let mut path = link.to_path_buf();
         for _ in 0..40 {
+            if is_machine_state(&path) {
+                break;
+            }
             let Ok(target) = fs::read_link(&path) else {
                 break;
             };

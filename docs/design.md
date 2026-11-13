@@ -106,7 +106,11 @@ Paths are recorded the way the command wrote them, joined to its working
 directory or directory file descriptor. If a symlink in the path later points
 somewhere else, evaluating the same path follows the new target and the
 lookup sees the change. Paths under `/proc` are resolved first, because
-`/proc/self/cwd/x` refers to the traced process and not to xcache.
+`/proc/self/cwd/x` refers to the traced process and not to xcache. So do
+`/dev/fd`, `/dev/stdin`, `/dev/stdout` and `/dev/stderr`, which are symlinks
+into `/proc/self`. xcache follows no other link into `/proc/self`, where it
+would find its own descriptors, and does not cache a command that reaches it
+through one.
 
 ### Deferred hashing
 
